@@ -100,7 +100,11 @@ class Bot:
         tick = self.api.ticker(); wallet = self.api.balance()
         self.state["pool_cash"]["crypto"] = float(wallet.get("USD", {}).get("Free", 0))   # wallet is truth
         fee = TAKER_FEE
-        held = {c: v["Free"] + v["Lock"] for c, v in wallet.items() if c != "USD" and v["Free"] + v["Lock"] > 0}
+        def _qv(c, v):
+            q = v["Free"] + v["Lock"]
+            px = float(tick.get(f"{c}/USD", {}).get("LastPrice") or 0)
+            return q > 0 and (px == 0 or q * px >= 5.0)      # ignore dust under $5; unknown price counts as held
+        held = {c: v["Free"] + v["Lock"] for c, v in wallet.items() if c != "USD" and _qv(c, v)}
         def _px(c):
             t = tick.get(f"{c}/USD", {})
             return float(t.get("LastPrice") or t.get("MaxBid") or t.get("MinAsk") or 0)
