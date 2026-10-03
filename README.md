@@ -1633,7 +1633,7 @@ Similarly, live execution code should not be changed simply to improve a histori
 
 ---
 
-# 31. End-to-End Workflow for the Team
+# 31. End-to-End Workflow for the Project
 
 A non-technical description of the system is:
 
