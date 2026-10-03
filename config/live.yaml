@@ -1,15 +1,13 @@
-
 timeframe: 30m
 crypto_weight: 1.0
-pos_frac: 0.15
+pos_frac: 0.10
 max_pos: {crypto: 5, equity: 0}
 allow_short: false
-exec_mode: run
+exec_mode: market
 limit_timeout_s: 90
 strategies:
   crypto: {builder: ma_cross, params: {fast: 50, slow: 200, kind: ema}}
   equity: null
 mode: run
-dd_ladder: []
-start_utc: "2026-10-03 00:00"
 dd_ladder: [[0.10, 0.5], [0.20, 0.25]]
+start_utc: "2026-10-03 00:00"
