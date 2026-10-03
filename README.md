@@ -1,498 +1,1883 @@
-# Roostoo Quant Research and Trading
+# Roostoo Quant Trading System
 
-**Team 187 (IITR) - Roostoo Quant Trading Hackathon**
-Repository: <https://github.com/AmanQEDS/roostoo-quant-trading>
-Roostoo API docs: <https://github.com/roostoo/Roostoo-API-Documents>
+## Quantitative Research, Strategy Development, Portfolio Construction, Backtesting, Validation and Live Execution
 
-A rule-based crypto research, backtesting and live-execution framework for the Roostoo mock exchange. The final deployed system is a single, simple, long-only trend-following strategy (EMA 50/200 cross on 30-minute bars) chosen through a development / validation protocol, then verified end to end with real fills before the live window.
-
-> **Honest summary.** No candidate passed every pre-set gate. The deployed strategy was the best of a weak family, was profitable on 2023-2025 development data and on the 2026 validation data, but it is a regime-dependent trend follower with a ~31% win rate and large drawdowns. Nothing here is a claim of proven alpha. Over a ~13-day live window the typical outcome is roughly flat; profit comes from a minority of strong-trend windows.
-
----
-
-## Table of contents
-
-1. [Final strategy specification](#1-final-strategy-specification)
-2. [Architecture](#2-architecture)
-3. [Data](#3-data)
-4. [Research protocol (dev / validation split)](#4-research-protocol)
-5. [Results](#5-results)
-6. [What was tested and rejected](#6-what-was-tested-and-rejected)
-7. [Costs and execution model](#7-costs-and-execution-model)
-8. [Risk management](#8-risk-management)
-9. [Live bot and operational verification](#9-live-bot-and-operational-verification)
-10. [Tokenized-stock finding](#10-tokenized-stock-finding)
-11. [Open-position and accounting audit](#11-open-position-and-accounting-audit)
-12. [Setup and how to run](#12-setup-and-how-to-run)
-13. [Deployment (AWS)](#13-deployment-aws)
-14. [Repository map](#14-repository-map)
-15. [Limitations and disclosures](#15-limitations-and-disclosures)
+**Repository:** `AmanQEDS/roostoo-quant-trading`  
+**Primary timeframe:** 30-minute bars  
+**Primary live strategy:** EMA(50/200) long-only cross-sectional crypto strategy  
+**Execution venue:** Roostoo  
+**Current live configuration:** `config/live.yaml`
 
 ---
 
-## 1. Final strategy specification
+## 1. Project Overview
 
-| Item | Value |
-|---|---|
-| Strategy | `ma_cross(fast=50, slow=200, kind=ema)` |
-| Timeframe | 30-minute bars (built from 5-minute klines) |
-| Direction | Long only (`allow_short: false`) |
-| Universe | Roostoo-tradable pairs `X/USD` with Binance `XUSDT` history (38 symbols in the research panel) |
-| Entry | EMA(50) crosses above EMA(200); exit when it crosses back below |
-| Entry ranking | When more signals than free slots, entries are ranked by signal score (highest first) |
-| Position sizing | `pos_frac = 0.15` of **remaining** cash per entry (sequential) |
-| Max positions | 5 |
-| Max theoretical exposure | `1 - (1 - 0.15)^5 = 55.6%` |
-| Order type | Market orders, taker fee 0.10% |
-| Drawdown ladder | **Off** (`dd_ladder: []`) - failed validation |
-| Correlation cap | **Not used** - never validated, not implemented live |
-| fng_momentum sleeve | **Not used** - not runnable live |
-| Stop-loss / halt / vol-scaling | **Not used** - rejected on development data |
-| Start gate | `start_utc: "2026-10-04 12:00"` (live window start, UTC) |
-| Kill switch | `mode: liquidate` in `config/live.yaml`, re-read every cycle |
+This repository contains the complete quantitative trading workflow developed for the Roostoo Quant Trading Competition.
 
-Sizing (`pos_frac`) was chosen on **development data only**, as a risk-appetite decision under a rule set before looking at the table: *the largest sizing whose dev max drawdown stays under about -50% and whose worst 14-day window stays under about -25%.* 0.15 was the largest that passed. It is a scale-up of the same signal, not a new strategy.
+The system is designed as a research-to-production pipeline rather than as a single trading script. It covers:
 
-Live config (`config/live.yaml`):
+1. Universe discovery from the Roostoo environment.
+2. Historical market-data acquisition and validation.
+3. Data-quality and gap auditing.
+4. Indicator and signal generation.
+5. Strategy research and candidate generation.
+6. Backtesting with transaction costs.
+7. Walk-forward and out-of-sample evaluation.
+8. Risk and sensitivity analysis.
+9. Portfolio allocation and position sizing.
+10. Strategy selection and freezing.
+11. Independent validation/audit.
+12. Live signal generation.
+13. Live order construction and execution through the Roostoo API.
+14. State management and drawdown-based risk controls.
+15. Test coverage and reproducibility.
+
+The important design principle is that the same conceptual strategy is carried from research into live execution. The research layer determines the strategy and portfolio rules; the live layer consumes the frozen configuration and translates signals into executable orders.
+
+---
+
+# 2. System Architecture
+
+```text
+                         ┌──────────────────────────────┐
+                         │        Roostoo API            │
+                         │  Market Data / Universe /     │
+                         │  Wallet / Orders / Ticker    │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │      Data Acquisition         │
+                         │ rq/roostoo/client.py          │
+                         │ rq/roostoo/universe.py        │
+                         │ rq/cli_download.py            │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │       Data Validation         │
+                         │ data_audit.py                  │
+                         │ gap_audit.py                   │
+                         │ check-data CLI                 │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │      Signal / Indicators      │
+                         │ indicators.py                  │
+                         │ signals/core.py                │
+                         │ signals/families.py            │
+                         │ signals/elliott.py             │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │        Research Layer         │
+                         │ loader.py / grid.py           │
+                         │ runner.py / selection.py      │
+                         │ walk-forward / sensitivity    │
+                         │ benchmark / regime / risk     │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │       Backtest Engine          │
+                         │ engine.py                      │
+                         │ metrics.py                     │
+                         │ risk.py                        │
+                         │ audit.py                       │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │     Portfolio Construction     │
+                         │ crypto/equity weights          │
+                         │ position fraction              │
+                         │ max positions                  │
+                         │ drawdown ladder                │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │      Independent Validation    │
+                         │ validate CLI / audit outputs   │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │          Live Bot              │
+                         │ rq/live/bot.py                 │
+                         │ 30m signal cycle               │
+                         │ wallet reconciliation           │
+                         │ order construction             │
+                         │ risk controls                  │
+                         └──────────────┬───────────────┘
+                                        │
+                         ┌──────────────▼───────────────┐
+                         │       Roostoo Orders           │
+                         │ Market execution               │
+                         └────────────────────────────────┘
+```
+
+---
+
+# 3. Research Philosophy
+
+The project follows a staged research process.
+
+```text
+Universe
+   ↓
+Data
+   ↓
+Data Quality
+   ↓
+Signal Research
+   ↓
+Candidate Strategies
+   ↓
+Backtest
+   ↓
+Walk-Forward / Out-of-Sample
+   ↓
+Cost / Correlation / Risk Sensitivity
+   ↓
+Allocation Sweep
+   ↓
+Freeze
+   ↓
+Independent Validation
+   ↓
+Dry-Run Live Simulation
+   ↓
+Deployment
+```
+
+This separation is important because a strong historical backtest alone is not sufficient evidence for deployment.
+
+The system therefore evaluates:
+
+- return,
+- Sharpe ratio,
+- Sortino ratio,
+- Calmar ratio,
+- maximum drawdown,
+- volatility,
+- downside deviation,
+- trade count,
+- fees,
+- final portfolio value,
+- rolling 14-day behavior,
+- sensitivity to costs,
+- sensitivity to correlations,
+- allocation sensitivity,
+- and live execution behavior.
+
+---
+
+# 4. Repository Structure
+
+The current repository contains the following principal components:
+
+```text
+.
+├── .env.example
+├── .gitignore
+├── README.md
+├── requirements.txt
+├── status.py
+│
+├── config/
+│   ├── default.yaml
+│   ├── live.yaml
+│   └── universe_overrides.yaml
+│
+├── rq/
+│   ├── __init__.py
+│   ├── cli.py
+│   ├── cli_download.py
+│   ├── config.py
+│   ├── constants.py
+│   ├── data_audit.py
+│   ├── execution.py
+│   ├── gap_audit.py
+│   ├── indicators.py
+│   │
+│   ├── backtest/
+│   │   ├── __init__.py
+│   │   ├── audit.py
+│   │   ├── engine.py
+│   │   ├── metrics.py
+│   │   └── risk.py
+│   │
+│   ├── live/
+│   │   ├── __init__.py
+│   │   └── bot.py
+│   │
+│   ├── research/
+│   │   ├── __init__.py
+│   │   ├── benchmarks.py
+│   │   ├── combine.py
+│   │   ├── combo.py
+│   │   ├── corr_sens.py
+│   │   ├── cost_sens.py
+│   │   ├── final_backtest.py
+│   │   ├── grid.py
+│   │   ├── loader.py
+│   │   ├── lock.py
+│   │   ├── regimes.py
+│   │   ├── risk_stability.py
+│   │   ├── risk_test.py
+│   │   ├── runner.py
+│   │   ├── selection.py
+│   │   ├── sizing_dev.py
+│   │   ├── w14_dist.py
+│   │   └── wf_fixed.py
+│   │
+│   ├── roostoo/
+│   │   ├── __init__.py
+│   │   ├── client.py
+│   │   └── universe.py
+│   │
+│   └── signals/
+│       ├── __init__.py
+│       ├── core.py
+│       ├── elliott.py
+│       └── families.py
+│
+└── tests/
+    ├── helpers.py
+    └── test_engine.py
+```
+
+---
+
+# 5. Configuration Layer
+
+## `config/default.yaml`
+
+The default research configuration.
+
+It contains the common parameters used by the research/backtest environment, including portfolio, transaction-cost and strategy-related settings.
+
+The purpose is to provide a reproducible baseline rather than embedding research parameters throughout Python files.
+
+---
+
+## `config/live.yaml`
+
+This is the live execution configuration.
+
+Current configuration:
 
 ```yaml
 timeframe: 30m
 crypto_weight: 1.0
-pos_frac: 0.15
+pos_frac: 0.10
 max_pos: {crypto: 5, equity: 0}
 allow_short: false
-exec_mode: run
+exec_mode: market
 limit_timeout_s: 90
 strategies:
   crypto: {builder: ma_cross, params: {fast: 50, slow: 200, kind: ema}}
   equity: null
 mode: run
-dd_ladder: []
-start_utc: "2026-10-04 12:00"
+dd_ladder: [[0.10, 0.5], [0.20, 0.25]]
+start_utc: "2026-10-03 00:00"
 ```
+
+Interpretation:
+
+| Parameter | Meaning |
+|---|---|
+| `timeframe` | Signal frequency is 30 minutes |
+| `crypto_weight` | 100% of portfolio allocation is assigned to crypto |
+| `pos_frac` | Base position fraction is 10% |
+| `max_pos.crypto` | Maximum of 5 simultaneous crypto positions |
+| `max_pos.equity` | Equity trading is disabled |
+| `allow_short` | Short positions are disabled |
+| `exec_mode` | Market execution |
+| `strategies.crypto` | EMA 50/200 crossover |
+| `mode` | Live execution mode |
+| `dd_ladder` | Position scaling reduces as portfolio drawdown increases |
+| `start_utc` | Live strategy start point |
+
+The live configuration is deliberately explicit so that deployment does not depend on hidden Python defaults.
 
 ---
 
-## 2. Architecture
+## `config/universe_overrides.yaml`
+
+Provides controlled overrides for the trading universe.
+
+This is useful when the live exchange universe differs from the research universe or when specific instruments require explicit handling.
+
+---
+
+# 6. Core Package
+
+## `rq/config.py`
+
+Loads and interprets YAML configuration.
+
+It creates the bridge between configuration files and Python components.
+
+---
+
+## `rq/constants.py`
+
+Contains project-wide constants such as research windows and other fixed configuration values.
+
+Centralizing these values prevents inconsistent dates and parameters across scripts.
+
+---
+
+## `rq/cli.py`
+
+The main command-line interface.
+
+Available commands include:
 
 ```text
-Roostoo exchangeInfo / ticker ---------+--> universe snapshot + live execution
-                                       |
-Binance Vision 5m crypto history ------+--> data panel (10m / 30m, close-time indexed)
-Yahoo underlying history (optional) ---+    + lagged Fear & Greed / VIX / DVOL
-                                             |
-                                             v
-Indicators -> signal families / Elliott -> target positions (Cond -> to_target)
-                                             |
-                                             v
-Research: train 2023-2025 -> report / walk-forward -> FREEZE shortlist
-          -> validate on 2026 (locked, logged) -> metrics + validation ledger
-                                             |
-Backtest engine: cash pools -> sequential sizing -> risk controls -> fees / slippage
-                                             |
-Live bot: Binance closed 5m bars -> same signal builders -> Roostoo ticker / balance
-          -> order planning -> Roostoo client (HMAC signed) -> API journal
+discover
+download
+check-data
+stage-a
+report
+walkforward
+alloc-sweep
+freeze
+validate
+baselines
+live
 ```
 
-Key design points:
+The CLI is the operational entry point for both research and live execution.
 
-- **One signal codebase.** The live bot calls the same builders (`rq.signals`) as the backtest, so live signals and backtest signals cannot diverge.
-- **No look-ahead.** Signals use information up to the close of bar *i*; orders fill at bar *i+1* (crypto at next open) plus slippage. External series (Fear & Greed, VIX, DVOL) are lagged by availability time.
-- **Roostoo has no history.** `/v3/ticker` is the only market-data endpoint. All research data comes from Binance; Roostoo is used only for the tradable universe, live prices, balances and orders.
-- **Sequential allocation.** A new position gets `pos_frac x (cash available right now)`, so sizes shrink geometrically as the pool fills. The live bot overwrites its cash figure from the real wallet USD balance every cycle (the wallet is the source of truth).
-- **Auditability.** Every API request and response is appended to `logs/api_journal.jsonl`. Every bot decision is in `logs/bot.log`. Config changes go through commits.
-
-### Live cycle
-
-1. Wake ~15 s after each 30-minute bar boundary.
-2. Re-read `config/live.yaml` (kill switch, start gate).
-3. Update the Binance feed, compute signals on the newest completed bar, drop stale coins.
-4. Read Roostoo ticker and wallet; mark equity = USD + holdings at last price.
-5. Exits first (signal off, or `mode: liquidate`). A held coin with **no** signal data is held, never force-sold.
-6. Entries ranked by score, up to the position cap, sized from real wallet cash.
-
----
-
-## 3. Data
-
-| Item | Detail |
-|---|---|
-| Source | Binance 5-minute klines (Binance Vision for history, REST for live) |
-| Research panel | 30-minute bars, 2023-01-01 to 2026-10-02 UTC, 65,761 bars |
-| Symbols in panel | 38 (all classified `crypto`; includes PAXG-style and tokenized-stock tickers, see [section 10](#10-tokenized-stock-finding)) |
-| Development set | 2023-01-01 to 2025-12-31 |
-| Validation set | 2026-01-01 onward (locked) |
-| Known data issues | A September 2026 gap from a downloader bug was found and fixed. One harmless 16-bar exchange halt on 2023-03-24 remains. |
-| Live feed note | TON stopped trading on Binance on 2026-06-30, so it returns an empty frame and is skipped without crashing. |
-
-Panel symbols: AAVE, ADA, APT, ARB, ASTER, AVAX, BNB, BTC, CRCLB, DOGE, DOT, ENA, ETH, FET, FIL, HBAR, ICP, LINK, LTC, MSTRB, NEAR, ONDO, PENGU, POL, PUMP, SNDKB, SOL, SPCXB, SUI, TAO, TRUMP, TRX, UNI, WLD, XLM, XPL, XRP, ZEC.
-
----
-
-## 4. Research protocol
-
-1. **Universe discovery** against the real Roostoo `exchangeInfo`/ticker (never assumed).
-2. **Strategy grid:** 88 specs across 28 builders (momentum, trend, mean reversion, breakouts, volatility gates, sentiment/Fear-and-Greed, multi-indicator combinations, regime switching, and a mechanical, falsifiable Elliott-wave rule set).
-3. **Stage A:** backtest the whole grid on development data (2023-2025) with gates on drawdown, trades per day and minimum trades.
-4. **Candidate selection:** *no candidate passed every gate mechanically.* The shortlist therefore involved quantitative judgement.
-5. **Shortlist freeze** (`results/shortlist.json`, frozen 2026-10-03 10:26:34, sha1 `88e5b1449619c49323d57b36bafe771650e784cf`):
-   - `fng_contrarian(exit_at=50, low=25)`
-   - `fng_momentum(n_days=7, thr=5)`
-   - `ma_cross(fast=50, kind=ema, slow=200)`
-6. **Validation lock:** `rq.research.lock` refuses to evaluate anything not on the frozen list and records every evaluation to `results/validation_ledger.jsonl`.
-7. **Robustness studies on development data only** (costs, regimes, half-years, walk-forward, combination, risk overlays, correlation, sizing).
-8. **Final specification frozen**, then operational testing with real fills.
-
-Selection-bias disclosure: in Stage A, the `ma_cross` family had a **median development return of -27%** and only **42% of its variants were positive**. 50/200 was the best tail of that family, so its development result is partly selection. The 2026 validation is the more honest number.
-
----
-
-## 5. Results
-
-### 5.1 Baselines (development 2023-2025, 100% crypto pool)
-
-| Baseline | Return | Sharpe | Sortino | Max DD |
-|---|---:|---:|---:|---:|
-| Buy and hold, equal weight (all) | +54.3% | 0.55 | 0.80 | -45.5% |
-| Buy and hold BTC | +128.8% | 1.13 | 1.74 | -24.5% |
-| Simple MA cross 20/50 | +1.2% | 0.09 | 0.14 | -19.0% |
-| Simple RSI 14 (30/55) | -11.1% | -0.80 | -0.97 | -14.6% |
-
-BTC buy-and-hold beat the deployed strategy's *risk-adjusted* profile on the development period (no fees applied to buy-and-hold). The deployed strategy is not claimed to beat it.
-
-### 5.2 Locked validation, 2026-01-01 to 2026-10-02 (pos_frac 0.10, max 5, 30m, fee 0.10%, slip 2 bp)
-
-| Strategy | Return | Sharpe | Notes |
-|---|---:|---:|---|
-| `fng_contrarian(exit_at=50, low=25)` | -2.0% | -0.08 | rejected |
-| `fng_momentum(n_days=7, thr=5)` | +8.1% | 0.77 | Sortino 1.34, DD -12.3%; not runnable live |
-| **`ma_cross(50, ema, 200)`** | **+17.1%** | **0.81** | Sortino 1.29, Calmar 1.09, daily DD -19.4%, bar-level DD -21.1% |
-| BTC buy and hold (2026) | -3.2% | | max DD -40.3% |
-
-`ma_cross` beta to BTC is about 0.36. Validation was run at `pos_frac` 0.10; the live setting of 0.15 is a development-based scale-up that was **not** re-run on 2026.
-
-### 5.3 Development performance of the deployed strategy (2023-2025, fee 0.10%, slip 2 bp)
-
-| pos_frac | Return | Sortino | Calmar | Max DD | Median 14d | Worst 14d | Positive 14d windows |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0.10 | +115.8% | 1.70 | 0.76 | -38.3% | -0.5% | -15.0% | 46% |
-| **0.15 (deployed)** | **+150.0%** | **1.65** | **0.75** | **-47.3%** | **-0.7%** | **-18.7%** | **46%** |
-| 0.20 | +173.0% | 1.61 | 0.74 | -53.5% | -0.8% | -21.3% | 46% |
-| 0.25 | +188.5% | 1.58 | 0.73 | -57.9% | -1.0% | -23.0% | 46% |
-| 0.30 | +198.6% | 1.56 | 0.72 | -61.2% | -1.1% | -24.2% | 47% |
-
-Sizing behaves almost like pure leverage: Sortino and Calmar barely move while return and drawdown scale together. The typical 14-day window is flat to slightly negative; the return comes from a minority of large trend windows.
-
-### 5.4 Half-year stability (fixed spec, development)
-
-| Half | ma_cross 50/200 | fng_momentum |
-|---|---:|---:|
-| 2023H1 | +28.3% | +6.2% |
-| 2023H2 | +21.3% | +15.0% |
-| 2024H1 | +4.3% | +0.4% |
-| 2024H2 | +67.7% | -2.5% |
-| 2025H1 | -27.6% (DD -33%) | -0.3% |
-| 2025H2 | +8.5% | +27.9% |
-| Positive halves | 5 of 6 | 4 of 6 |
-
-### 5.5 Walk-forward (pick best on train, test next year)
-
-| Strategy | Test year | Picked | Test return | Grid median |
-|---|---|---|---:|---:|
-| ma_cross | 2024 | 50/200 | +75.7% | +26.8% |
-| ma_cross | 2025 | 50/200 | **-21.3%** | -27.5% |
-| fng_momentum | 2024 | 7/5 | -2.1% | +3.0% |
-| fng_momentum | 2025 | 7/10 | -0.4% | +13.5% |
-
-### 5.6 Regime behaviour (ma_cross, development)
-
-Regimes: BTC 30-day trailing return > +10% bull, < -10% bear, else sideways; volatility versus an expanding median. Labels are shifted one bar so they are known before the bar's return.
-
-| Regime | Return | Sortino | Max DD | Trades | Win rate |
-|---|---:|---:|---:|---:|---:|
-| Bull | +134.7% | 3.74 | -21.4% | 327 | 34% |
-| Bear | +6.8% | 1.17 | -17.7% | 208 | 25% |
-| **Sideways** | **-37.5%** | -1.37 | **-44.7%** | 797 | 26% |
-| High vol | +59.3% | 1.61 | -27.2% | 645 | 29% |
-| Low vol | -4.0% | 0.04 | -28.6% | 690 | 28% |
-
-`ma_cross` is a classic trend follower: it earns in trends and bleeds through whipsaws in sideways markets. No regime filter was added because any filter would be a new strategy needing its own validation.
-
----
-
-## 6. What was tested and rejected
-
-### 6.1 Risk overlays (development, ma_cross 50/200, pos_frac 0.10)
-
-| Variant | Return | Sortino | Calmar | Max DD | Worst 14d | Verdict |
-|---|---:|---:|---:|---:|---:|---|
-| None | 115.8% | 1.70 | 0.76 | -38.3% | -15.0% | baseline |
-| Stop-loss 5% | 95.4% | 1.54 | 0.68 | -37.0% | -14.2% | rejected |
-| DD ladder 10%->x0.5, 20%->x0.25 | 96.3% | 2.05 | 1.04 | -24.3% | -9.9% | **passed dev, failed validation** |
-| DD halt 25% (3-day pause) | 106.8% | 1.62 | 0.70 | -38.9% | -15.0% | rejected |
-| Vol scaling | 70.8% | 1.42 | 0.58 | -33.4% | -11.1% | rejected |
-| Ladder + halt 30% | 96.3% | 2.05 | 1.04 | -24.3% | -9.9% | identical to ladder |
-
-**Ladder stability (dev):** all neighbouring thresholds beat "none" on Calmar and max DD, so the ladder was not a knife-edge on development data. A variant that drops size to zero (`20/.0`) killed 2024 (+0.9%).
-
-**Ladder on 2026 validation (single go/no-go on the frozen spec, no other settings tried):**
-
-| 2026 | Bare | With ladder |
-|---|---:|---:|
-| Return | **+17.14%** | +1.93% |
-| Realized / unrealized | +16.01% / +1.13% | +0.78% / +1.15% |
-| Sharpe / Sortino / Calmar | 0.81 / 1.29 / 1.09 | 0.13 / 0.20 / 0.04 |
-| Bar-level max DD | -21.1% | -17.5% |
-| Fees | $4,999 | $3,437 |
-
-The ladder cut drawdown by only ~3.5 points while giving up ~15 points of return, and it keeps size small until equity recovers within 10% of its peak - a poor trade in a short, return-ranked window. **It was dropped for that reason.** This decision used 2026 information and is disclosed as such; no other ladder settings were tested on 2026.
-
-### 6.2 Strategy combination (development, daily-rebalanced mix of two equity curves)
-
-Daily-return correlation 0.48 (downside: 0.35 when ma<0, 0.54 when fng<0).
-
-| ma_cross weight | Return | Sharpe | Sortino | Calmar | Max DD | Worst half-year |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1.00 | 115.8% | 1.00 | 1.70 | 0.76 | -38.3% | -29.6% |
-| 0.75 | 101.6% | 1.08 | 1.82 | 0.85 | -31.2% | -23.1% |
-| 0.50 | 86.0% | 1.15 | 1.92 | 0.98 | -23.4% | -16.0% |
-| 0.25 | 69.4% | 1.18 | 1.92 | 1.07 | -18.0% | -8.4% |
-| 0.00 | 52.3% | 1.04 | 1.65 | 0.65 | -23.2% | -2.5% |
-
-Diversification reduces risk, but the screen ranks by **return first**, `fng_momentum` is not runnable live (it needs a Fear-and-Greed fetch in the bot), and adding untested code a day before launch was judged the larger risk. Not adopted.
-
-### 6.3 Correlation cap (development only)
-
-| Cap | Return | Sortino | Calmar | Max DD | Trades |
-|---|---:|---:|---:|---:|---:|
-| Off | 115.8% | 1.70 | 0.76 | -38.3% | 1354 |
-| 0.80 | 133.6% | 1.85 | 0.93 | -35.2% | 1350 |
-| 0.70 | 154.6% | 2.05 | 1.08 | -33.7% | 1292 |
-| 0.60 | 170.6% | 2.20 | 1.24 | -31.7% | 1201 |
-
-Monotonic improvement looks attractive but is exactly the pattern that invites over-fitting. It was **not frozen before validation, not implemented in the live bot, and cannot be validated without contaminating the 2026 lock**. Not adopted.
-
----
-
-## 7. Costs and execution model
-
-- **Fee:** 0.10% taker, confirmed on real test fills (fee is exactly 0.1% of notional). Maker 0.05% exists but limit orders are not implemented; the bot uses **market orders only**.
-- **Slippage:** 2 bp assumed in backtests.
-- **Round trip:** about 0.2% plus slippage. The strategy makes ~1.2 trades/day in backtest, a steady drag in choppy markets.
-
-Cost sensitivity (development, ma_cross 50/200, pos_frac 0.10; return by fee x slippage):
-
-| Fee \ slip | 0 bp | 2 bp | 5 bp | 10 bp |
-|---|---:|---:|---:|---:|
-| 0.05% | +148.5% | +138.7% | +124.7% | +103.1% |
-| **0.10%** | +124.7% | **+115.8%** | +103.2% | +83.7% |
-| 0.15% | +103.2% | +95.2% | +83.7% | +66.1% |
-
-Positive in all 12 cells, so costs are not the weakness; the weakness is regime dependence.
-
----
-
-## 8. Risk management
-
-**Automated (live bot):**
-
-- Hard cap of 5 concurrent positions and sequential position sizing (max ~55.6% exposure).
-- Kill switch: `mode: liquidate` is re-read each cycle and sells every holding without buying.
-- Held coins are never sold merely because a data feed failed.
-- `place_order` is a single attempt (no blind retry), so a timeout cannot double-buy; the next cycle reads the real wallet.
-
-**Not automated (accepted risk):**
-
-- The live bot has **no** drawdown ladder, halt or stop-loss. A bad stretch is stopped only by the operator.
-- **Operator rule:** if portfolio equity falls 35% from the starting value, switch `mode` to `liquidate` by committing the change. This is a disaster rule, not a tuned parameter.
-
-Expectations for a ~13-day window (judgement, not a measured forecast): typical outcome about flat; roughly 54% of development 14-day windows lost money; worst development 14-day window at 0.15 sizing was -18.7%.
-
----
-
-## 9. Live bot and operational verification
-
-Tested with real fills on the General Portfolio key (test wallet $50,000) before switching to the competition key.
-
-| Test | Result |
-|---|---|
-| Authentication and balance (`SpotWallet` response key) | Pass (client reads `SpotWallet`, falls back to `Wallet`) |
-| Real fills | 22 fills in total across the test session |
-| Fee on fills | Exactly 0.10% |
-| Sequential sizing | Pass (e.g. notionals of roughly $5.0k, $4.5k, $4.0k, $3.6k, $3.3k at 0.10 sizing) |
-| Entry ranking by score | Pass (`entry order (score desc)` logged each cycle) |
-| Kill switch (`mode: liquidate` across a bar boundary) | **Pass** - at 15:00:35 the bot sold all five holdings and placed no buys |
-| Resume (`mode: run`) | **Pass** - five ranked buys on the startup cycle |
-| Crash/restart recovery | **Pass** - restart placed no buy or sell for coins already held; position cap respected |
-| Duplicate processes | On Windows a venv launcher shows as parent + child process; verified via parent PID |
-| Unit tests | 10 of 10 pass (`tests/test_engine.py`) |
-
-Bugs found and fixed during the audit (no strategy changes):
-
-1. Balance key: client expected `Wallet`; the API returns `SpotWallet`.
-2. Stale-signal handling: use the newest bar, drop stale coins.
-3. Live entries were not ranked by score (backtest ranks); fixed.
-4. A held coin missing from the signal frame was force-sold; now held.
-5. Permanent removal of a coin from the feed on a single error; now retried each bar.
-6. Order retry on timeout could double-buy; `place_order` now makes one attempt.
-7. Sizing used a ledger cash figure instead of the wallet; now synced from the wallet each cycle.
-8. `logs/` directory created at startup so a fresh clone does not crash.
-9. A repeated `SELL BNB` in dry-run was a dry-run artifact (nothing changes the wallet), not an order-state bug.
-
-Monitoring: `python status.py` reads only `logs/bot.log` and `state/ledger.json` (no API calls, so nothing extra appears in the API journal). It reports last heartbeat (flags STALE after 40 minutes), last signal, equity line, fills and errors.
-
----
-
-## 10. Tokenized-stock finding
-
-The Roostoo universe contains tokenized equities (for example NVDAB, MSTRB, MUB, CRCLB, SNDKB, SPCXB, NBISB, AMDB) alongside crypto and PAXG.
-
-- Their market history only starts around **June 2026**, so there is **no usable multi-year history** and no meaningful crypto-versus-equity split test. The planned equity pool is therefore unusable for research (`equity cols = 0` in the research panel).
-- They **trade on weekends**, unlike the underlying stocks.
-- Our asset-class heuristic classifies them as `crypto`, and the live bot treats every tradable pair the same way. Several tokenized stocks have appeared in live signals and test fills (NVDAB, MSTRB, NBISB, AMDB).
-- Consequence: part of the live universe has far less historical evidence than the crypto assets the strategy was developed on. This is disclosed rather than hidden.
-
----
-
-## 11. Open-position and accounting audit
-
-A concern was that the 2026 result might be mostly unrealized P&L on open positions. After the data fix, the audit shows it is not.
-
-| 2026 ma_cross (bare, pos_frac 0.10) | Value |
-|---|---:|
-| Starting capital | $100,000 |
-| Ending portfolio value | $117,142.75 |
-| Realized P&L | +$16,009.63 (93.4%) |
-| Unrealized P&L | +$1,133.11 (6.6%) |
-| Fees | $4,998.70 |
-| Completed trades | 340 |
-| Open positions at end | 5 |
-| Win rate | 30.88% |
-| Profit factor | 1.213 |
-| Average trade net P&L | $47.09 |
-| Median holding period | 56.25 hours |
-
-Max drawdown is -19.4% on the daily-sampled metric and -21.1% on the 30-minute audit curve; the difference is sampling frequency, not a strategy change. The audit checks pass: no duplicate trade IDs, chronological timestamps, and trade, equity and open-position ledgers reconcile. Audit files are written to `results/` (`trades_*`, `equity_*`, `open_positions_*`).
-
----
-
-## 12. Setup and how to run
-
-Python 3.10 or newer. Windows PowerShell shown; use the equivalent on Linux.
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-```
-
-`.env` holds credentials and is git-ignored. **Never commit it or paste keys anywhere.**
-
-```text
-ROOSTOO_API_KEY=your_api_key_here
-ROOSTOO_API_SECRET=your_api_secret_here
-# "test" = General Portfolio credentials, "competition" = Competition credentials
-ROOSTOO_ENV=test
-```
-
-### Research workflow
-
-```powershell
-python -m rq.cli discover                    # snapshot the real Roostoo universe
-python -m rq.cli download --no-equity        # Binance history
-python -m rq.cli check-data
-python -m rq.cli stage-a --freq 30m --modes L
-python -m rq.cli report --stage A --freq 30m
-python -m rq.cli walkforward --builder ma_cross --freq 30m
-python -m rq.cli baselines --freq 30m --stage A
-python -m rq.cli freeze "<exact name>" "<exact name>"     # one-time lock
-python -m rq.cli validate --freq 30m                      # 2026, frozen names only
-python -m pytest tests -q
-```
-
-### Robustness and final studies (development data unless noted)
-
-```powershell
-python -m rq.research.cost_sens
-python -m rq.research.regimes
-python -m rq.research.wf_fixed
-python -m rq.research.combo
-python -m rq.research.risk_test
-python -m rq.research.risk_stability
-python -m rq.research.corr_sens
-python -m rq.research.sizing_dev
-python -m rq.research.final_backtest        # 2026: bare vs ladder, reported not tuned
-```
-
-### Live bot
-
-```powershell
-python -m rq.cli live --dry-run     # logs intended orders, sends none
-python -m rq.cli live --confirm     # real orders (requires explicit flag)
-python status.py                    # read-only monitor
-```
-
-Kill switch (commit and apply):
-
-```powershell
-(Get-Content config\live.yaml) -replace '^mode:.*','mode: liquidate' | Set-Content config\live.yaml -Encoding ascii
-```
-
-Write `config/live.yaml` as ASCII: PowerShell 5 `-Encoding utf8` adds a BOM that breaks YAML parsing.
-
----
-
-## 13. Deployment (AWS)
-
-- **Region:** Singapore (`ap-southeast-1`), Tokyo or Hong Kong. Binance returns HTTP 451 from US IPs.
-- **Instance:** t3.small or t3.micro, Ubuntu 22.04/24.04, SSH only.
+Important example:
 
 ```bash
-sudo apt update && sudo apt install -y python3-venv python3-pip git tmux
-timedatectl                                   # expect UTC, clock synchronized
-git clone https://github.com/AmanQEDS/roostoo-quant-trading.git
-cd roostoo-quant-trading
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-mkdir -p logs state
-nano .env && chmod 600 .env                   # competition key, ROOSTOO_ENV=competition
-ls state/                                     # must be empty (no ledger.json)
-python -m rq.cli live --dry-run               # expect: before start_utc ... idle
-tmux new -s bot
-python -m rq.cli live --confirm
+python -m rq.cli walkforward --help
 ```
 
-Detach with `Ctrl+B` then `D`; reattach with `tmux attach -t bot`. Do not call the Roostoo API manually with the competition key: judges inspect the journal for manual calls.
+The actual available command is `walkforward`; there is no `wf-fixed` CLI command.
+
+The fixed walk-forward research implementation exists as a Python research module rather than as a separate CLI command.
 
 ---
 
-## 14. Repository map
+## `rq/cli_download.py`
 
-| Path | Responsibility |
-|---|---|
-| `rq/roostoo/` | Roostoo REST client (HMAC signing, retries, JSONL journal) and universe discovery |
-| `rq/data/` | Downloads, alignment, panel construction |
-| `rq/signals/`, `rq/indicators.py` | Strategy families, Elliott rule set, causal indicators, `Cond` / `to_target` plumbing |
-| `rq/backtest/` | Engine, risk overlays (`risk.py`), metrics, accounting audit (`audit.py`) |
-| `rq/research/` | Grid, runner, selection, lock, and the robustness studies listed above |
-| `rq/live/bot.py`, `rq/execution.py` | Live loop and order sizing/rounding |
-| `rq/cli.py` | Command-line entry point |
-| `config/` | `default.yaml` (research), `live.yaml` (deployed), `universe_overrides.yaml` |
-| `tests/` | Deterministic portfolio-accounting unit tests |
-| `status.py` | Read-only live monitor |
-| `results/` | Experiment log, shortlist, validation ledger, sensitivity tables (git-ignored) |
+Provides the download-side command functionality used to acquire historical Roostoo data.
 
 ---
 
-## 15. Limitations and disclosures
+## `rq/execution.py`
 
-- **No claim of proven alpha.** The deployed signal is a trend follower that loses in sideways markets (-37.5% in the dev sideways regime) and lost -27.6% in 2025H1.
-- **Selection bias.** 50/200 was the best tail of a family whose median dev variant lost money.
-- **Validation used once, then partly informed a decision.** The drawdown ladder was dropped after its 2026 result. Sizing (0.15) was chosen on development data and was not re-run on 2026.
-- **Different capital in tests.** Backtests used $100,000; the test wallet was $50,000; the competition wallet should be confirmed from the first `equity` log line. Sizing adapts because cash is read from the wallet each cycle.
-- **Thin evidence for tokenized stocks** (about three months of history) inside a universe the strategy was not developed on.
-- **Backtest is not a fill guarantee.** Real slippage, market impact and API behaviour can differ; live fills matched the 0.10% fee model.
-- **No automated drawdown protection live.** Disaster handling is a manual operator rule.
-- **Data dependence.** Live signals use Binance klines; a Binance outage degrades signals (held positions are held, not sold).
-- **Short window.** Over about 13 days the median development outcome is roughly flat to slightly negative with about 46% positive windows. Treat results as a draw from a wide distribution, not a forecast.
+Contains execution-related abstractions shared by the trading workflow.
+
+It separates execution behavior from the research logic.
+
+---
+
+## `rq/indicators.py`
+
+Provides technical indicators used by strategies.
+
+The indicator layer exists separately from the portfolio and execution layers so that indicators can be reused by multiple strategy families.
+
+---
+
+## `rq/data_audit.py`
+
+Performs data-quality checks.
+
+The objective is to identify problems in the historical dataset before those problems contaminate strategy results.
+
+---
+
+## `rq/gap_audit.py`
+
+Focuses specifically on missing bars and discontinuities.
+
+This is important for a 30-minute strategy because missing bars can change indicator values and create artificial signals.
+
+---
+
+# 7. Roostoo Integration
+
+## `rq/roostoo/client.py`
+
+The exchange/API client.
+
+It is responsible for communication with Roostoo for functions such as:
+
+- market data,
+- ticker information,
+- account balance,
+- wallet state,
+- order placement,
+- exchange interaction,
+- API request handling.
+
+The live bot uses this layer instead of embedding raw API calls throughout the trading logic.
+
+---
+
+## `rq/roostoo/universe.py`
+
+Discovers and represents the actual Roostoo trading universe.
+
+This distinction matters because the system should not assume that a research ticker list is automatically identical to the live exchange universe.
+
+---
+
+# 8. Signal Architecture
+
+## `rq/signals/core.py`
+
+Contains core signal-building functionality and shared signal interfaces.
+
+---
+
+## `rq/signals/families.py`
+
+Contains the broader collection of signal/strategy families used during research.
+
+This allows the project to compare different signal structures under the same research and backtest infrastructure.
+
+---
+
+## `rq/signals/elliott.py`
+
+Contains Elliott-wave-related signal logic.
+
+It is part of the broader research library and is not the final live strategy.
+
+---
+
+# 9. Backtesting Engine
+
+The backtesting layer is responsible for converting historical signals into simulated portfolio behavior.
+
+## `rq/backtest/engine.py`
+
+The core portfolio/backtest engine.
+
+It handles the progression of the portfolio through time, including:
+
+- signals,
+- positions,
+- cash,
+- portfolio value,
+- fills,
+- transaction effects,
+- position changes,
+- mark-to-market behavior.
+
+The purpose is to ensure that strategy returns are generated from simulated trading rather than from simply multiplying signal columns by future returns.
+
+---
+
+## `rq/backtest/metrics.py`
+
+Calculates performance statistics.
+
+Important metrics include:
+
+- Total return
+- Sharpe ratio
+- Sortino ratio
+- Calmar ratio
+- Maximum drawdown
+- Volatility
+- Downside deviation
+- Trade count
+- Fees
+- Final portfolio value
+
+These metrics are used consistently across research and validation.
+
+---
+
+## `rq/backtest/risk.py`
+
+Implements portfolio risk controls.
+
+The live configuration uses a drawdown ladder:
+
+```text
+Drawdown < 10%       → 100% risk multiplier
+Drawdown ≥ 10%       → 50% risk multiplier
+Drawdown ≥ 20%       → 25% risk multiplier
+```
+
+This does not predict returns. It controls exposure after losses increase.
+
+---
+
+## `rq/backtest/audit.py`
+
+Provides independent accounting/audit functionality.
+
+The audit layer checks the resulting portfolio and trade records rather than relying only on the headline backtest metrics.
+
+This was important during the final validation stage because the strategy had open positions and therefore realized and unrealized P&L needed to be separated.
+
+---
+
+# 10. Research Infrastructure
+
+## `rq/research/loader.py`
+
+Loads the research data panel and supporting extended data.
+
+This provides the common data interface used by research runners.
+
+---
+
+## `rq/research/grid.py`
+
+Defines the strategy search space.
+
+It allows multiple strategy specifications to be generated and evaluated consistently.
+
+---
+
+## `rq/research/runner.py`
+
+The research execution layer.
+
+It connects:
+
+```text
+Data
+  ↓
+Strategy Specification
+  ↓
+Portfolio Configuration
+  ↓
+Backtest
+  ↓
+Metrics
+```
+
+This keeps the individual research scripts relatively small and reproducible.
+
+---
+
+## `rq/research/selection.py`
+
+Implements candidate selection.
+
+The purpose is to move from a large research set toward a smaller shortlist based on documented performance and stability criteria.
+
+---
+
+## `rq/research/lock.py`
+
+Provides the mechanism for freezing/locking selected research configurations.
+
+The purpose of a lock is to prevent the final deployed configuration from silently changing because of later research experimentation.
+
+---
+
+## `rq/research/final_backtest.py`
+
+Runs the final selected strategy configuration through a standardized backtest.
+
+It is intended to provide a clean final research result after exploratory work.
+
+---
+
+## `rq/research/benchmarks.py`
+
+Provides benchmark/reference comparisons.
+
+This helps distinguish whether a strategy is generating useful behavior relative to simpler reference approaches.
+
+---
+
+## `rq/research/combine.py`
+
+Combines research outputs where multiple strategy or portfolio components need to be evaluated together.
+
+---
+
+## `rq/research/combo.py`
+
+Contains combination logic for strategy research and portfolio combinations.
+
+---
+
+## `rq/research/corr_sens.py`
+
+Performs correlation sensitivity analysis.
+
+The objective is to test whether portfolio results depend excessively on a particular assumed relationship between assets or strategy components.
+
+---
+
+## `rq/research/cost_sens.py`
+
+Performs transaction-cost sensitivity analysis.
+
+This is important because a strategy with many trades can appear profitable before fees but become weak after realistic trading costs.
+
+---
+
+## `rq/research/regimes.py`
+
+Contains market-regime analysis functionality.
+
+It is used to investigate how strategy behavior changes under different market environments.
+
+---
+
+## `rq/research/risk_stability.py`
+
+Examines stability of risk characteristics rather than focusing only on total return.
+
+---
+
+## `rq/research/risk_test.py`
+
+Provides targeted risk tests for candidate strategies/configurations.
+
+---
+
+## `rq/research/sizing_dev.py`
+
+Research/development code for position-sizing behavior.
+
+It is separate from the production live bot so that sizing experiments do not automatically change deployment behavior.
+
+---
+
+## `rq/research/wf_fixed.py`
+
+Contains the fixed walk-forward research implementation.
+
+Important distinction:
+
+```text
+wf_fixed.py
+    ≠
+CLI command "wf-fixed"
+```
+
+The CLI currently exposes:
+
+```bash
+python -m rq.cli walkforward ...
+```
+
+rather than:
+
+```bash
+python -m rq.cli wf-fixed ...
+```
+
+This distinction prevented an incorrect command from being used during the final research phase.
+
+---
+
+## `rq/research/w14_dist.py`
+
+Calculates the distribution of forward 14-day returns for the selected strategy and risk configuration.
+
+The final run produced:
+
+```text
+windows: 1082
+total return: 96.3%
+max drawdown: -24.3%
+average exposure: 20%
+
+14-day return:
+mean     0.95%
+median  -0.40%
+
+5%       -4.84%
+10%      -3.50%
+25%      -1.93%
+50%      -0.40%
+75%       1.98%
+90%       5.76%
+95%      11.29%
+```
+
+Frequency of outcomes:
+
+```text
+14-day return > 0%      : 45%
+14-day return > +5%     : 12%
+14-day return > +10%    : 6%
+14-day return < -5%     : 5%
+14-day return < -10%    : 0%
+```
+
+### Interpretation
+
+The distribution is not uniformly positive.
+
+The median 14-day return is negative at `-0.40%`, while the mean is positive at `+0.95%`.
+
+This indicates positive outcomes are skewing the average upward.
+
+The left tail is materially smaller than the right tail over this development sample:
+
+- only 5% of 14-day windows lost more than 5%;
+- no sampled 14-day window lost more than 10%;
+- 12% gained more than 5%;
+- 6% gained more than 10%.
+
+The result therefore supports the existence of favorable return windows but also shows that positive performance is not constant over every 14-day period.
+
+---
+
+# 11. Strategy Development
+
+The research process evaluated multiple signal families.
+
+Two important crypto candidates reached the final comparison stage:
+
+### A. EMA 50/200 Moving-Average Cross
+
+```text
+ma_cross(
+    fast=50,
+    slow=200,
+    kind=ema
+)
+```
+
+Logic:
+
+- calculate a 50-period exponential moving average;
+- calculate a 200-period exponential moving average;
+- bullish regime when the fast EMA is above the slow EMA;
+- bearish/flat condition when the relationship reverses;
+- final live implementation is long-only.
+
+The strategy is deliberately simple and robust.
+
+---
+
+### B. 7-Day Fear & Greed Momentum
+
+```text
+fng_momentum(
+    n_days=7,
+    thr=5
+)
+```
+
+This strategy uses changes in the Fear & Greed signal over a seven-day horizon.
+
+It demonstrated better risk-adjusted behavior in the allocation sweep than the EMA strategy in some configurations, but the EMA strategy remained the selected deployment configuration based on the broader research/freeze process and final live configuration.
+
+---
+
+# 12. Allocation Sweep Results
+
+The allocation sweep tested how crypto portfolio weight interacted with position sizing.
+
+## EMA 50/200
+
+The median-over-sizing-grid results were:
+
+| Crypto Weight | Return | Sharpe | Sortino | Calmar | Max DD | Composite |
+|---:|---:|---:|---:|---:|---:|---:|
+| 20% | 24.2% | 0.699 | 1.146 | 0.394 | -19.0% | 0.784 |
+| 30% | 36.4% | 0.749 | 1.237 | 0.441 | -24.7% | 0.851 |
+| 40% | 48.5% | 0.792 | 1.314 | 0.489 | -29.0% | 0.909 |
+| 50% | 60.6% | 0.830 | 1.378 | 0.537 | -32.4% | 0.961 |
+
+Increasing crypto weight increased both return and drawdown.
+
+The sweep therefore demonstrated a fundamental portfolio trade-off:
+
+```text
+More crypto exposure
+        ↓
+Higher expected portfolio return in this sample
+        +
+Higher drawdown / volatility
+```
+
+---
+
+## EMA Selected Sizing Configuration
+
+A representative strong configuration was:
+
+```text
+crypto weight = 50%
+position fraction = 5%
+max crypto positions = 5
+```
+
+Result:
+
+```text
+total return     +33.2%
+Sharpe            0.933
+Sortino           1.589
+Calmar            0.614
+max drawdown     -16.3%
+volatility         10.9%
+downside dev       6.4%
+trades             1,354
+fees               $8,546
+final value        $133,156
+composite          1.100
+```
+
+The sweep also showed that increasing position fraction to 10% could raise total return to approximately `42.1%` in the tested configuration, but maximum drawdown increased to approximately `-22.9%`.
+
+Therefore position sizing materially changes the risk profile even when the underlying signal remains identical.
+
+---
+
+# 13. Fear & Greed Momentum Allocation Results
+
+For:
+
+```text
+fng_momentum(n_days=7,thr=5)
+```
+
+the median-over-sizing-grid results were:
+
+| Crypto Weight | Return | Sharpe | Sortino | Calmar | Max DD | Composite |
+|---:|---:|---:|---:|---:|---:|---:|
+| 20% | 9.7% | 0.765 | 1.188 | 0.412 | -7.9% | 0.828 |
+| 30% | 14.6% | 0.775 | 1.208 | 0.422 | -11.3% | 0.842 |
+| 40% | 19.4% | 0.786 | 1.227 | 0.432 | -14.4% | 0.856 |
+| 50% | 24.3% | 0.795 | 1.246 | 0.442 | -17.3% | 0.869 |
+
+The strategy generated lower raw returns than the EMA strategy in the tested allocation framework, but its drawdowns were materially smaller.
+
+Its strongest tested configuration included:
+
+```text
+crypto weight = 50%
+position fraction = 5%
+max crypto positions = 5
+```
+
+with:
+
+```text
+return        +14.3%
+Sharpe         1.046
+Sortino        1.670
+Calmar         0.627
+max drawdown  -7.3%
+volatility      4.4%
+trades          355
+fees           $1,771
+final value   $114,312
+composite       1.170
+```
+
+This illustrates why strategy selection cannot be based on return alone.
+
+---
+
+# 14. Independent Validation Results
+
+The final validation command was:
+
+```bash
+python -m rq.cli validate --freq 30m
+```
+
+The validation period was:
+
+```text
+2026-01-01 → 2026-10-02
+```
+
+Starting capital:
+
+```text
+$100,000
+```
+
+---
+
+## Strategy 1 — Fear & Greed Contrarian
+
+```text
+fng_contrarian(exit_at=50,low=25)
+```
+
+Results:
+
+```text
+Ending value       $97,995.29
+Total return         -2.00%
+Realized P&L       -$2,004.71
+Unrealized P&L         $0.00
+Fees                  $244.39
+Completed trades        15
+Open positions           0
+Daily max DD          -16.09%
+Bar-level max DD      -18.40%
+Win rate               46.67%
+Profit factor           0.803
+Average trade P&L   -$133.65
+Median holding       2232 hours
+Sharpe                 -0.08
+Sortino                -0.12
+Calmar                 -0.21
+```
+
+This candidate did not produce positive validation performance.
+
+---
+
+## Strategy 2 — Fear & Greed Momentum
+
+```text
+fng_momentum(n_days=7,thr=5)
+```
+
+Results:
+
+```text
+Ending value       $108,081.31
+Total return          +8.08%
+Realized P&L        +$8,081.31
+Unrealized P&L          $0.00
+Fees                $1,416.42
+Completed trades        90
+Open positions           0
+Daily max DD          -12.31%
+Bar-level max DD      -14.22%
+Win rate               43.33%
+Profit factor           1.392
+Average trade P&L       $89.79
+Median holding         108 hours
+Sharpe                   0.77
+Sortino                  1.34
+Calmar                   0.89
+```
+
+This candidate produced positive validation performance with moderate drawdown.
+
+---
+
+## Strategy 3 — EMA 50/200
+
+```text
+ma_cross(fast=50,kind=ema,slow=200)
+```
+
+Results:
+
+```text
+Ending portfolio value    $117,142.75
+Total return                  +17.14%
+Realized P&L                 +$16,009.63
+Unrealized P&L                +$1,133.11
+Total fees                   $4,998.70
+Completed trades                 340
+Open positions                     5
+Daily max drawdown              -19.38%
+Bar-level max drawdown          -21.09%
+Realized return                  +16.01%
+Unrealized return                 +1.13%
+Closed-trade win rate             30.88%
+Profit factor                      1.213
+Average trade net P&L             $47.09
+Median holding period             56.25 hours
+Sharpe                              0.81
+Sortino                             1.29
+Calmar                              1.09
+```
+
+The final portfolio value is composed of:
+
+```text
+$100,000 starting capital
++
+$16,009.63 realized P&L
++
+$1,133.11 unrealized P&L
+=
+$117,142.74 approximately
+```
+
+The small rounding difference versus the reported final value is expected from the displayed precision.
+
+---
+
+# 15. How to Interpret the Final EMA Result
+
+The final EMA result should not be described simply as "the bot makes 17%".
+
+The more accurate interpretation is:
+
+> On the specified 30-minute validation period and the implemented portfolio/accounting assumptions, the EMA 50/200 strategy generated a +17.14% portfolio return, with a -19.38% daily maximum drawdown and -21.09% bar-level audited drawdown, while paying approximately $5,000 in fees.
+
+The strategy therefore has meaningful return potential but also meaningful downside risk.
+
+The 30.88% closed-trade win rate is not inherently contradictory to positive returns.
+
+A trend-following strategy can have a low win rate when:
+
+```text
+many trades lose small amounts
+        +
+a smaller number of trades capture large trends
+        =
+positive aggregate P&L
+```
+
+The profit factor of `1.213` confirms that gross profitable trade contribution exceeded gross losing trade contribution, after the implemented trade accounting.
+
+---
+
+# 16. 14-Day Distribution Analysis
+
+The separate distribution analysis produced:
+
+```text
+Development windows: 1082
+
+Total return       +96.3%
+Max drawdown       -24.3%
+Average exposure    20%
+```
+
+Forward 14-day return distribution:
+
+| Percentile | Return |
+|---:|---:|
+| 5th | -4.84% |
+| 10th | -3.50% |
+| 25th | -1.93% |
+| 50th | -0.40% |
+| 75th | +1.98% |
+| 90th | +5.76% |
+| 95th | +11.29% |
+
+The key observation is that the median forward window is slightly negative while the mean is positive.
+
+That means the distribution is asymmetric and the strategy's long-run result is not generated by winning every short horizon.
+
+---
+
+# 17. Live Portfolio Construction
+
+The current live configuration is:
+
+```text
+Timeframe:          30 minutes
+Asset class:        Crypto only
+Crypto allocation:  100%
+Equity allocation:    0%
+Position fraction:   10%
+Maximum positions:    5
+Shorting:             Disabled
+Execution:            Market
+Strategy:             EMA 50/200
+```
+
+The distinction between `crypto_weight` and `pos_frac` is important.
+
+- `crypto_weight` controls how much of the portfolio belongs to the crypto sleeve.
+- `pos_frac` controls the base fraction used when sizing an individual position.
+
+The maximum number of simultaneous crypto positions limits concentration.
+
+---
+
+# 18. Drawdown Ladder
+
+The live configuration includes:
+
+```yaml
+dd_ladder:
+  - [0.10, 0.5]
+  - [0.20, 0.25]
+```
+
+Operationally:
+
+```text
+Normal state:
+    exposure multiplier = 1.00
+
+Drawdown >= 10%:
+    exposure multiplier = 0.50
+
+Drawdown >= 20%:
+    exposure multiplier = 0.25
+```
+
+The objective is to reduce risk after adverse portfolio-level performance.
+
+The drawdown ladder is a risk overlay; it does not create alpha.
+
+---
+
+# 19. Live Bot
+
+## `rq/live/bot.py`
+
+This is the production execution component.
+
+Its responsibilities include:
+
+1. Read the live configuration.
+2. Connect to Roostoo.
+3. Retrieve current ticker data.
+4. Retrieve wallet/account state.
+5. Build the current 30-minute signal bar.
+6. Determine long candidates.
+7. Rank candidates by strategy score.
+8. Apply portfolio/risk constraints.
+9. Build orders.
+10. Submit orders in live mode.
+11. Reconcile wallet state.
+12. Maintain portfolio state.
+13. Apply drawdown risk controls.
+
+---
+
+# 20. Live Dry-Run Verification
+
+The live bot was executed in dry-run mode:
+
+```bash
+python -m rq.cli live --dry-run
+```
+
+Observed behavior included:
+
+```text
+14 long / 0 short
+```
+
+and ranked candidates such as:
+
+```text
+WLD
+AAVE
+GLWB
+AMDB
+NVDAB
+MSTRB
+NBISB
+LTC
+ICP
+UNI
+BIO
+AVNT
+SOL
+SUI
+```
+
+The bot generated simulated buy instructions such as:
+
+```text
+BUY WLD
+BUY AAVE
+BUY GLWB
+BUY AMDB
+BUY NVDAB
+```
+
+The signal ranking changed slightly between consecutive 30-minute bars, while the portfolio/risk state remained stable.
+
+This demonstrated that the live loop was:
+
+- reading the market,
+- calculating signals,
+- ranking assets,
+- constructing orders,
+- and waiting for the next 30-minute bar.
+
+---
+
+# 21. Wallet Reconciliation and Dust Handling
+
+A live-execution issue was identified around tiny residual asset balances.
+
+The bot was modified to ignore positions whose marked value is below approximately `$5`, while treating unknown prices conservatively.
+
+Conceptually:
+
+```text
+asset quantity > 0
+        +
+known market price
+        +
+position value >= $5
+        ↓
+consider as held position
+```
+
+Tiny residual balances are therefore prevented from being interpreted as meaningful portfolio positions.
+
+Unknown prices are handled conservatively rather than automatically assuming the asset is dust.
+
+This prevents small exchange leftovers from interfering with maximum-position calculations.
+
+---
+
+# 22. Live State
+
+The live bot maintains state separately from the strategy research output.
+
+The wallet is treated as the source of truth for available cash.
+
+The bot also maintains portfolio state such as:
+
+- cash,
+- positions,
+- peak equity,
+- drawdown,
+- risk multiplier,
+- strategy state.
+
+This separation is important because exchange state and local state can diverge if an order partially fills, is rejected, or if the process restarts.
+
+---
+
+# 23. Tests
+
+The project was tested with:
+
+```bash
+python -m pytest -q
+```
+
+Latest result:
+
+```text
+10 passed in 0.95s
+```
+
+The tests cover core engine behavior and provide a regression check before deployment.
+
+The repository also contains:
+
+```text
+tests/helpers.py
+tests/test_engine.py
+```
+
+The test suite is intentionally kept separate from research scripts.
+
+---
+
+# 24. Git / Reproducibility
+
+The final strategy and live-execution changes were committed and pushed.
+
+Final recorded commit:
+
+```text
+ecce954
+```
+
+Commit message:
+
+```text
+Finalize 30m EMA strategy and live execution
+```
+
+The repository was successfully pushed to:
+
+`AmanQEDS/roostoo-quant-trading`
+
+The repository tree at the documented final commit includes the live bot, research modules, configuration, Roostoo integration, strategy modules and tests.
+
+---
+
+# 25. Deployment Configuration
+
+Before switching from dry-run to actual execution, the production environment must contain the required Roostoo credentials.
+
+The repository provides:
+
+```text
+.env.example
+```
+
+Secrets should not be committed to Git.
+
+The expected deployment architecture is:
+
+```text
+Cloud/VM
+   │
+   ├── Python environment
+   ├── Repository
+   ├── Environment variables
+   │      └── Roostoo API credentials
+   │
+   └── Live process
+          │
+          └── python -m rq.cli live
+                  │
+                  ├── 30m signal cycle
+                  ├── portfolio/risk state
+                  └── Roostoo orders
+```
+
+---
+
+# 26. Production Startup Procedure
+
+A production deployment should follow this order.
+
+## Step 1 — Pull the final repository
+
+```bash
+git clone https://github.com/AmanQEDS/roostoo-quant-trading.git
+cd roostoo-quant-trading
+```
+
+Or, for an existing deployment:
+
+```bash
+git pull
+```
+
+---
+
+## Step 2 — Create the environment
+
+```bash
+python -m venv .venv
+```
+
+Windows:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+Linux:
+
+```bash
+source .venv/bin/activate
+```
+
+---
+
+## Step 3 — Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Step 4 — Configure credentials
+
+Create the local environment configuration from `.env.example`.
+
+Never commit the actual API key.
+
+---
+
+## Step 5 — Verify the repository
+
+```bash
+python -m pytest -q
+```
+
+Expected:
+
+```text
+10 passed
+```
+
+---
+
+## Step 6 — Verify live configuration
+
+```bash
+python -c "import yaml; print(yaml.safe_load(open('config/live.yaml')))"
+```
+
+Expected strategy:
+
+```text
+ma_cross
+fast=50
+slow=200
+kind=ema
+timeframe=30m
+```
+
+---
+
+## Step 7 — Perform a dry run
+
+```bash
+python -m rq.cli live --dry-run
+```
+
+Confirm:
+
+- signal bars are advancing;
+- symbols are valid;
+- wallet is readable;
+- equity is reasonable;
+- positions are ranked correctly;
+- order quantities are sensible;
+- no unexpected positions are detected;
+- no repeated pathological orders are produced.
+
+---
+
+## Step 8 — Start production execution
+
+Once credentials and exchange permissions are verified:
+
+```bash
+python -m rq.cli live
+```
+
+The bot then runs continuously and evaluates the strategy on the 30-minute schedule.
+
+---
+
+# 27. Operational Monitoring
+
+During live execution, monitor:
+
+### Market/data layer
+
+- timestamp freshness;
+- missing bars;
+- stale prices;
+- unexpected symbols.
+
+### Strategy layer
+
+- number of long signals;
+- number of short signals;
+- ranking changes;
+- signal consistency between bars.
+
+### Portfolio layer
+
+- equity;
+- cash;
+- number of positions;
+- largest position;
+- portfolio drawdown;
+- risk multiplier.
+
+### Execution layer
+
+- submitted orders;
+- fills;
+- rejected orders;
+- partial fills;
+- API errors;
+- wallet reconciliation.
+
+### Risk layer
+
+- current drawdown;
+- peak equity;
+- drawdown ladder state;
+- exposure.
+
+---
+
+# 28. Important Research Findings
+
+The research process established several practical conclusions.
+
+## 28.1 Return and risk move together
+
+Higher crypto allocation increased return but also materially increased drawdown.
+
+Therefore allocation cannot be chosen using return alone.
+
+---
+
+## 28.2 Position sizing matters
+
+The EMA sweep demonstrated that increasing the position fraction can significantly increase total return while simultaneously increasing drawdown.
+
+The signal and sizing layers therefore need to be evaluated separately.
+
+---
+
+## 28.3 Transaction costs matter
+
+The EMA strategy generated thousands of trades in some portfolio configurations and paid substantial fees.
+
+For example:
+
+```text
+1,354 trades
+≈ $8,546 fees
+```
+
+in the representative allocation sweep.
+
+Therefore gross strategy performance without costs would be misleading.
+
+---
+
+## 28.4 A low win rate does not automatically invalidate trend following
+
+The final EMA validation showed:
+
+```text
+Win rate = 30.88%
+Profit factor = 1.213
+Total return = +17.14%
+```
+
+The strategy relies on asymmetric payoff from successful trends rather than a high percentage of winning trades.
+
+---
+
+## 28.5 Short-horizon performance is uneven
+
+The 14-day distribution had:
+
+```text
+median = -0.40%
+mean   = +0.95%
+```
+
+Therefore the system should not be expected to produce positive returns every two weeks.
+
+---
+
+## 28.6 Risk controls are essential
+
+The final EMA validation experienced approximately:
+
+```text
+-19.38% daily maximum drawdown
+-21.09% bar-level audited maximum drawdown
+```
+
+This is substantial.
+
+The drawdown ladder exists specifically to reduce portfolio exposure after losses.
+
+---
+
+# 29. Current Production Strategy
+
+The current live strategy is:
+
+```text
+==================================================
+Strategy:       EMA 50/200 crossover
+Frequency:      30 minutes
+Universe:       Roostoo crypto universe
+Direction:      Long only
+Shorting:       Disabled
+Crypto weight:  100%
+Position size:  10%
+Max positions:  5
+Execution:      Market
+Risk overlay:   Drawdown ladder
+==================================================
+```
+
+Signal concept:
+
+```text
+EMA(50) > EMA(200)
+        ↓
+        Long candidate
+
+EMA(50) <= EMA(200)
+        ↓
+        No long signal
+```
+
+The final live portfolio then ranks active candidates and selects positions subject to the position and risk constraints.
+
+---
+
+# 30. Research vs Production Separation
+
+The repository intentionally contains both experimental and production-oriented code.
+
+```text
+RESEARCH
+├── grid search
+├── walk-forward
+├── benchmarks
+├── cost sensitivity
+├── correlation sensitivity
+├── regime analysis
+├── risk tests
+├── sizing development
+└── distribution analysis
+
+PRODUCTION
+├── config/live.yaml
+├── rq/live/bot.py
+├── rq/roostoo/client.py
+├── rq/roostoo/universe.py
+├── execution
+└── state/risk handling
+```
+
+Research files should not be modified casually after the live configuration has been frozen.
+
+Similarly, live execution code should not be changed simply to improve a historical backtest.
+
+---
+
+# 31. End-to-End Workflow for the Team
+
+A non-technical description of the system is:
+
+### Stage 1 — Find the tradable assets
+
+The system asks Roostoo what assets are actually available.
+
+### Stage 2 — Collect historical data
+
+Historical market data is downloaded and organized into a research panel.
+
+### Stage 3 — Check the data
+
+Missing bars, gaps and inconsistent data are investigated.
+
+### Stage 4 — Generate signals
+
+The system calculates technical indicators and strategy signals.
+
+### Stage 5 — Simulate trading
+
+The backtest engine pretends to trade according to the strategy.
+
+### Stage 6 — Include realistic costs
+
+Fees and slippage are included so that the results are not artificially optimistic.
+
+### Stage 7 — Test outside the development sample
+
+Walk-forward and validation procedures test whether the strategy continues to behave reasonably outside the research selection process.
+
+### Stage 8 — Test portfolio sizing
+
+The system checks how much capital should be assigned to crypto and how large individual positions should be.
+
+### Stage 9 — Test risk
+
+Drawdown, volatility, downside risk and rolling return distributions are evaluated.
+
+### Stage 10 — Freeze the configuration
+
+The chosen strategy and parameters are explicitly recorded.
+
+### Stage 11 — Validate independently
+
+The validation layer reconstructs portfolio/trade statistics and reports realized and unrealized P&L separately.
+
+### Stage 12 — Dry run
+
+The live bot connects to the exchange but only prints the orders it would send.
+
+### Stage 13 — Production execution
+
+The same signal logic is connected to actual Roostoo order execution.
+
+---
+
+# 32. Key Performance Snapshot
+
+## Final validation
+
+| Metric | EMA 50/200 |
+|---|---:|
+| Validation return | **+17.14%** |
+| Ending value | **$117,142.75** |
+| Realized P&L | **+$16,009.63** |
+| Unrealized P&L | **+$1,133.11** |
+| Fees | **$4,998.70** |
+| Completed trades | **340** |
+| Open positions | **5** |
+| Win rate | **30.88%** |
+| Profit factor | **1.213** |
+| Sharpe | **0.81** |
+| Sortino | **1.29** |
+| Calmar | **1.09** |
+| Daily max DD | **-19.38%** |
+| Bar-level max DD | **-21.09%** |
+
+---
+
+# 33. Important Interpretation
+
+The project has progressed beyond the stage of simply finding a profitable historical signal.
+
+The current system contains:
+
+```text
+Data
++
+Data Quality
++
+Signal Generation
++
+Backtesting
++
+Transaction Costs
++
+Portfolio Construction
++
+Risk Controls
++
+Independent Validation
++
+Live API Integration
++
+Dry-Run Execution
++
+Automated Tests
+```
+
+The final EMA strategy has demonstrated positive performance over the documented validation period, but that performance comes with material drawdown and should be treated as a model result under the tested assumptions rather than as a guarantee of future performance.
+
+The most important production principle is therefore:
+
+> Preserve the tested strategy, portfolio rules, accounting logic and risk controls during deployment. Do not optimize the live system based on short-term live P&L.
+
+---
+
+# 34. Quick Command Reference
+
+## Research
+
+```bash
+python -m rq.cli discover
+python -m rq.cli download
+python -m rq.cli check-data
+python -m rq.cli stage-a
+python -m rq.cli report
+python -m rq.cli walkforward --help
+```
+
+## Allocation
+
+```bash
+python -m rq.cli alloc-sweep --help
+```
+
+Example:
+
+```bash
+python -m rq.cli alloc-sweep \
+  --crypto "ma_cross(fast=50,kind=ema,slow=200)" \
+  --freq 30m
+```
+
+## Validation
+
+```bash
+python -m rq.cli validate --freq 30m
+```
+
+## Distribution analysis
+
+```bash
+python -m rq.research.w14_dist
+```
+
+## Testing
+
+```bash
+python -m pytest -q
+```
+
+## Live dry run
+
+```bash
+python -m rq.cli live --dry-run
+```
+
+## Live execution
+
+```bash
+python -m rq.cli live
+```
+
+---
+
+# 35. Repository Status
+
+The documented production branch is `main`.
+
+The final recorded strategy/live-execution commit is:
+
+```text
+ecce954
+```
+
+The repository was pushed successfully to GitHub.
+
+The project should be treated as a versioned quantitative trading system: changes to strategy parameters, risk settings, execution logic or accounting should be tested and committed separately rather than mixed into an uncontrolled live deployment.
+
+---
+
+# 36. Closing Architecture
+
+```text
+                         ROOSTOO
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │ Data + Ticker │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │ Data Quality  │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │  Indicators   │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │ EMA 50 / 200  │
+                    └───────┬───────┘
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │ Signal Ranking│
+                    └───────┬───────┘
+                            │
+                            ▼
+                 ┌──────────────────────┐
+                 │ Portfolio Constraints│
+                 │ max positions / size │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                 ┌──────────────────────┐
+                 │ Drawdown Risk Ladder │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                 ┌──────────────────────┐
+                 │ Order Construction   │
+                 └──────────┬───────────┘
+                            │
+                            ▼
+                       ROOSTOO API
+                            │
+                            ▼
+                       LIVE ORDERS
+```
+
+This architecture keeps the research process, portfolio construction, risk controls, accounting and exchange execution as separate but connected layers. That separation is the core design choice that makes the project reproducible, testable and deployable.
