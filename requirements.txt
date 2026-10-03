@@ -1,0 +1,8 @@
+pandas>=2.2
+numpy>=1.26
+pyyaml>=6.0
+requests>=2.31
+pyarrow>=15.0
+yfinance>=0.2.40      # equity underlyings (daily / 1h history)
+pytest>=8.0
+matplotlib>=3.8       # optional, plots only

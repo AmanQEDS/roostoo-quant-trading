@@ -1,0 +1,8 @@
+# Manual truth for anything the heuristics get wrong. Fill after running `python -m rq.cli discover`.
+class: {}          # e.g. {"TSLAX": "equity", "PAXG": "commodity"}
+# Map Roostoo equity coin -> Yahoo Finance ticker of the underlying (history proxy).
+yahoo_underlying: {}   # e.g. {"TSLAX": "TSLA", "NVDAX": "NVDA"}
+# Equity buckets for large-cap vs small/mid-cap baskets (decide AFTER seeing the real list).
+equity_baskets:
+  large_cap: []
+  small_mid_cap: []

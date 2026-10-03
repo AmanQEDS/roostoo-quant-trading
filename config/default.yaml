@@ -1,0 +1,22 @@
+data:
+  start: "2023-01-01"
+  crypto_top_n: 40              # top-N Roostoo crypto pairs by 24h USD volume that also exist on Binance spot
+  max_spread_bps: 15            # drop pairs whose quoted spread makes market orders too costly
+  min_usd_vol_24h: 1000000.0
+  equity_interval: "1h"         # free Yahoo depth ~730d at 1h; use a paid source for 10m/30m history
+  equity_session: true          # trade equities only inside US regular hours (conservative)
+timeframes: ["10m", "30m"]
+portfolio:
+  capital: 100000
+  crypto_weights: [0.2, 0.3, 0.4, 0.5]
+  pos_frac: [0.05, 0.10, 0.15, 0.20]
+  max_pos_crypto: [3, 5, 10]
+  max_pos_equity: [5, 10, 15]
+  slip_bps: {crypto: 2.0, equity: 5.0}
+gates:
+  max_trades_per_day: 12
+  max_drawdown: 0.30
+  min_trades: 30
+live:
+  min_active_days: 8            # competition rule: >= 8 active trading days with enough trades
+  loop_seconds: 60
