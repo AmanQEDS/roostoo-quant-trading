@@ -6,7 +6,7 @@ allow_short: false
 exec_mode: market
 limit_timeout_s: 90
 strategies:
-  crypto: {builder: ma_cross, params: {fast: 50, slow: 200, kind: ema}}
+  crypto: {builder: ema_donchian, params: {fast: 50, slow: 200, n: 24}}
   equity: null
 mode: run
 dd_ladder: [[0.10, 0.5], [0.20, 0.25]]

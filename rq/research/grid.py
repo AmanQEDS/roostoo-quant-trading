@@ -25,6 +25,7 @@ def build_grid() -> list[Spec]:
     for n in (48, 96, 192): g.append(S("xsmom", n=n, top=0.3, hold=0.6))
     for n, b in itertools.product((50, 100, 200), (0.0, 0.003)): g.append(S("price_ma", n=n, kind="ema", band=b))
     for (f, s), k in itertools.product(((20, 50), (20, 100), (50, 200)), ("ema", "sma")): g.append(S("ma_cross", fast=f, slow=s, kind=k))
+    g.append(S("ema_donchian", fast=50, slow=200, n=24))
     for f, s, sg in ((12, 26, 9), (24, 52, 18)): g.append(S("macd_sig", fast=f, slow=s, sig=sg))
     for thr in (20, 25): g.append(S("adx_trend", fast=20, slow=50, thr=thr))
     for n, (x, y) in itertools.product((14, 21, 28), ((30, 55), (25, 50), (30, 70))): g.append(S("rsi_mr", n=n, x=x, y=y))

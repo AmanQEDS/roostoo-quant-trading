@@ -1,11 +1,11 @@
-# Roostoo Quant Trading System
+﻿# Roostoo Quant Trading System
 
 ## Quantitative Research, Strategy Development, Portfolio Construction, Backtesting, Validation and Live Execution
 
-**Repository:** `AmanQEDS/roostoo-quant-trading`  
-**Primary timeframe:** 30-minute bars  
-**Primary live strategy:** EMA(50/200) long-only cross-sectional crypto strategy  
-**Execution venue:** Roostoo  
+**Repository:** `AmanQEDS/roostoo-quant-trading`
+**Primary timeframe:** 30-minute bars
+**Primary live strategy:** EMA(50/200) + Donchian(24) long-only crypto strategy
+**Execution venue:** Roostoo
 **Current live configuration:** `config/live.yaml`
 
 ---
@@ -39,76 +39,76 @@ The important design principle is that the same conceptual strategy is carried f
 # 2. System Architecture
 
 ```text
-                         ┌──────────────────────────────┐
-                         │        Roostoo API            │
-                         │  Market Data / Universe /     │
-                         │  Wallet / Orders / Ticker    │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │      Data Acquisition         │
-                         │ rq/roostoo/client.py          │
-                         │ rq/roostoo/universe.py        │
-                         │ rq/cli_download.py            │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │       Data Validation         │
-                         │ data_audit.py                  │
-                         │ gap_audit.py                   │
-                         │ check-data CLI                 │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │      Signal / Indicators      │
-                         │ indicators.py                  │
-                         │ signals/core.py                │
-                         │ signals/families.py            │
-                         │ signals/elliott.py             │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │        Research Layer         │
-                         │ loader.py / grid.py           │
-                         │ runner.py / selection.py      │
-                         │ walk-forward / sensitivity    │
-                         │ benchmark / regime / risk     │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │       Backtest Engine          │
-                         │ engine.py                      │
-                         │ metrics.py                     │
-                         │ risk.py                        │
-                         │ audit.py                       │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │     Portfolio Construction     │
-                         │ crypto/equity weights          │
-                         │ position fraction              │
-                         │ max positions                  │
-                         │ drawdown ladder                │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │      Independent Validation    │
-                         │ validate CLI / audit outputs   │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │          Live Bot              │
-                         │ rq/live/bot.py                 │
-                         │ 30m signal cycle               │
-                         │ wallet reconciliation           │
-                         │ order construction             │
-                         │ risk controls                  │
-                         └──────────────┬───────────────┘
-                                        │
-                         ┌──────────────▼───────────────┐
-                         │       Roostoo Orders           │
-                         │ Market execution               │
-                         └────────────────────────────────┘
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚        Roostoo API            â”‚
+                         â”‚  Market Data / Universe /     â”‚
+                         â”‚  Wallet / Orders / Ticker    â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚      Data Acquisition         â”‚
+                         â”‚ rq/roostoo/client.py          â”‚
+                         â”‚ rq/roostoo/universe.py        â”‚
+                         â”‚ rq/cli_download.py            â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚       Data Validation         â”‚
+                         â”‚ data_audit.py                  â”‚
+                         â”‚ gap_audit.py                   â”‚
+                         â”‚ check-data CLI                 â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚      Signal / Indicators      â”‚
+                         â”‚ indicators.py                  â”‚
+                         â”‚ signals/core.py                â”‚
+                         â”‚ signals/families.py            â”‚
+                         â”‚ signals/elliott.py             â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚        Research Layer         â”‚
+                         â”‚ loader.py / grid.py           â”‚
+                         â”‚ runner.py / selection.py      â”‚
+                         â”‚ walk-forward / sensitivity    â”‚
+                         â”‚ benchmark / regime / risk     â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚       Backtest Engine          â”‚
+                         â”‚ engine.py                      â”‚
+                         â”‚ metrics.py                     â”‚
+                         â”‚ risk.py                        â”‚
+                         â”‚ audit.py                       â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚     Portfolio Construction     â”‚
+                         â”‚ crypto/equity weights          â”‚
+                         â”‚ position fraction              â”‚
+                         â”‚ max positions                  â”‚
+                         â”‚ drawdown ladder                â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚      Independent Validation    â”‚
+                         â”‚ validate CLI / audit outputs   â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚          Live Bot              â”‚
+                         â”‚ rq/live/bot.py                 â”‚
+                         â”‚ 30m signal cycle               â”‚
+                         â”‚ wallet reconciliation           â”‚
+                         â”‚ order construction             â”‚
+                         â”‚ risk controls                  â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                                        â”‚
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â–¼â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚       Roostoo Orders           â”‚
+                         â”‚ Market execution               â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 ```
 
 ---
@@ -119,29 +119,29 @@ The project follows a staged research process.
 
 ```text
 Universe
-   ↓
+   â†“
 Data
-   ↓
+   â†“
 Data Quality
-   ↓
+   â†“
 Signal Research
-   ↓
+   â†“
 Candidate Strategies
-   ↓
+   â†“
 Backtest
-   ↓
+   â†“
 Walk-Forward / Out-of-Sample
-   ↓
+   â†“
 Cost / Correlation / Risk Sensitivity
-   ↓
+   â†“
 Allocation Sweep
-   ↓
+   â†“
 Freeze
-   ↓
+   â†“
 Independent Validation
-   ↓
+   â†“
 Dry-Run Live Simulation
-   ↓
+   â†“
 Deployment
 ```
 
@@ -173,73 +173,73 @@ The current repository contains the following principal components:
 
 ```text
 .
-├── .env.example
-├── .gitignore
-├── README.md
-├── requirements.txt
-├── status.py
-│
-├── config/
-│   ├── default.yaml
-│   ├── live.yaml
-│   └── universe_overrides.yaml
-│
-├── rq/
-│   ├── __init__.py
-│   ├── cli.py
-│   ├── cli_download.py
-│   ├── config.py
-│   ├── constants.py
-│   ├── data_audit.py
-│   ├── execution.py
-│   ├── gap_audit.py
-│   ├── indicators.py
-│   │
-│   ├── backtest/
-│   │   ├── __init__.py
-│   │   ├── audit.py
-│   │   ├── engine.py
-│   │   ├── metrics.py
-│   │   └── risk.py
-│   │
-│   ├── live/
-│   │   ├── __init__.py
-│   │   └── bot.py
-│   │
-│   ├── research/
-│   │   ├── __init__.py
-│   │   ├── benchmarks.py
-│   │   ├── combine.py
-│   │   ├── combo.py
-│   │   ├── corr_sens.py
-│   │   ├── cost_sens.py
-│   │   ├── final_backtest.py
-│   │   ├── grid.py
-│   │   ├── loader.py
-│   │   ├── lock.py
-│   │   ├── regimes.py
-│   │   ├── risk_stability.py
-│   │   ├── risk_test.py
-│   │   ├── runner.py
-│   │   ├── selection.py
-│   │   ├── sizing_dev.py
-│   │   ├── w14_dist.py
-│   │   └── wf_fixed.py
-│   │
-│   ├── roostoo/
-│   │   ├── __init__.py
-│   │   ├── client.py
-│   │   └── universe.py
-│   │
-│   └── signals/
-│       ├── __init__.py
-│       ├── core.py
-│       ├── elliott.py
-│       └── families.py
-│
-└── tests/
-    ├── helpers.py
-    └── test_engine.py
+â”œâ”€â”€ .env.example
+â”œâ”€â”€ .gitignore
+â”œâ”€â”€ README.md
+â”œâ”€â”€ requirements.txt
+â”œâ”€â”€ status.py
+â”‚
+â”œâ”€â”€ config/
+â”‚   â”œâ”€â”€ default.yaml
+â”‚   â”œâ”€â”€ live.yaml
+â”‚   â””â”€â”€ universe_overrides.yaml
+â”‚
+â”œâ”€â”€ rq/
+â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”œâ”€â”€ cli.py
+â”‚   â”œâ”€â”€ cli_download.py
+â”‚   â”œâ”€â”€ config.py
+â”‚   â”œâ”€â”€ constants.py
+â”‚   â”œâ”€â”€ data_audit.py
+â”‚   â”œâ”€â”€ execution.py
+â”‚   â”œâ”€â”€ gap_audit.py
+â”‚   â”œâ”€â”€ indicators.py
+â”‚   â”‚
+â”‚   â”œâ”€â”€ backtest/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ audit.py
+â”‚   â”‚   â”œâ”€â”€ engine.py
+â”‚   â”‚   â”œâ”€â”€ metrics.py
+â”‚   â”‚   â””â”€â”€ risk.py
+â”‚   â”‚
+â”‚   â”œâ”€â”€ live/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â””â”€â”€ bot.py
+â”‚   â”‚
+â”‚   â”œâ”€â”€ research/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ benchmarks.py
+â”‚   â”‚   â”œâ”€â”€ combine.py
+â”‚   â”‚   â”œâ”€â”€ combo.py
+â”‚   â”‚   â”œâ”€â”€ corr_sens.py
+â”‚   â”‚   â”œâ”€â”€ cost_sens.py
+â”‚   â”‚   â”œâ”€â”€ final_backtest.py
+â”‚   â”‚   â”œâ”€â”€ grid.py
+â”‚   â”‚   â”œâ”€â”€ loader.py
+â”‚   â”‚   â”œâ”€â”€ lock.py
+â”‚   â”‚   â”œâ”€â”€ regimes.py
+â”‚   â”‚   â”œâ”€â”€ risk_stability.py
+â”‚   â”‚   â”œâ”€â”€ risk_test.py
+â”‚   â”‚   â”œâ”€â”€ runner.py
+â”‚   â”‚   â”œâ”€â”€ selection.py
+â”‚   â”‚   â”œâ”€â”€ sizing_dev.py
+â”‚   â”‚   â”œâ”€â”€ w14_dist.py
+â”‚   â”‚   â””â”€â”€ wf_fixed.py
+â”‚   â”‚
+â”‚   â”œâ”€â”€ roostoo/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ client.py
+â”‚   â”‚   â””â”€â”€ universe.py
+â”‚   â”‚
+â”‚   â””â”€â”€ signals/
+â”‚       â”œâ”€â”€ __init__.py
+â”‚       â”œâ”€â”€ core.py
+â”‚       â”œâ”€â”€ elliott.py
+â”‚       â””â”€â”€ families.py
+â”‚
+â””â”€â”€ tests/
+    â”œâ”€â”€ helpers.py
+    â””â”€â”€ test_engine.py
 ```
 
 ---
@@ -289,7 +289,7 @@ Interpretation:
 | `max_pos.equity` | Equity trading is disabled |
 | `allow_short` | Short positions are disabled |
 | `exec_mode` | Market execution |
-| `strategies.crypto` | EMA 50/200 crossover |
+| `strategies.crypto` | EMA(50/200) + Donchian(24) |
 | `mode` | Live execution mode |
 | `dd_ladder` | Position scaling reduces as portfolio drawdown increases |
 | `start_utc` | Live strategy start point |
@@ -499,9 +499,9 @@ Implements portfolio risk controls.
 The live configuration uses a drawdown ladder:
 
 ```text
-Drawdown < 10%       → 100% risk multiplier
-Drawdown ≥ 10%       → 50% risk multiplier
-Drawdown ≥ 20%       → 25% risk multiplier
+Drawdown < 10%       â†’ 100% risk multiplier
+Drawdown â‰¥ 10%       â†’ 50% risk multiplier
+Drawdown â‰¥ 20%       â†’ 25% risk multiplier
 ```
 
 This does not predict returns. It controls exposure after losses increase.
@@ -544,13 +544,13 @@ It connects:
 
 ```text
 Data
-  ↓
+  â†“
 Strategy Specification
-  ↓
+  â†“
 Portfolio Configuration
-  ↓
+  â†“
 Backtest
-  ↓
+  â†“
 Metrics
 ```
 
@@ -654,7 +654,7 @@ Important distinction:
 
 ```text
 wf_fixed.py
-    ≠
+    â‰
 CLI command "wf-fixed"
 ```
 
@@ -792,7 +792,7 @@ The sweep therefore demonstrated a fundamental portfolio trade-off:
 
 ```text
 More crypto exposure
-        ↓
+        â†“
 Higher expected portfolio return in this sample
         +
 Higher drawdown / volatility
@@ -889,7 +889,7 @@ python -m rq.cli validate --freq 30m
 The validation period was:
 
 ```text
-2026-01-01 → 2026-10-02
+2026-01-01 â†’ 2026-10-02
 ```
 
 Starting capital:
@@ -900,7 +900,7 @@ $100,000
 
 ---
 
-## Strategy 1 — Fear & Greed Contrarian
+## Strategy 1 â€” Fear & Greed Contrarian
 
 ```text
 fng_contrarian(exit_at=50,low=25)
@@ -931,7 +931,7 @@ This candidate did not produce positive validation performance.
 
 ---
 
-## Strategy 2 — Fear & Greed Momentum
+## Strategy 2 â€” Fear & Greed Momentum
 
 ```text
 fng_momentum(n_days=7,thr=5)
@@ -962,7 +962,7 @@ This candidate produced positive validation performance with moderate drawdown.
 
 ---
 
-## Strategy 3 — EMA 50/200
+## Strategy 3 â€” EMA 50/200
 
 ```text
 ma_cross(fast=50,kind=ema,slow=200)
@@ -1076,7 +1076,7 @@ Position fraction:   10%
 Maximum positions:    5
 Shorting:             Disabled
 Execution:            Market
-Strategy:             EMA 50/200
+Strategy:             EMA 50/200 + Donchian 24
 ```
 
 The distinction between `crypto_weight` and `pos_frac` is important.
@@ -1210,7 +1210,7 @@ asset quantity > 0
 known market price
         +
 position value >= $5
-        ↓
+        â†“
 consider as held position
 ```
 
@@ -1270,7 +1270,7 @@ The test suite is intentionally kept separate from research scripts.
 
 # 24. Git / Reproducibility
 
-The final strategy and live-execution changes were committed and pushed.
+The final strategy and live-execution changes are validated locally before the next commit.
 
 Final recorded commit:
 
@@ -1284,7 +1284,7 @@ Commit message:
 Finalize 30m EMA strategy and live execution
 ```
 
-The repository was successfully pushed to:
+The repository should be pushed only after the current validation suite passes:
 
 `AmanQEDS/roostoo-quant-trading`
 
@@ -1308,19 +1308,19 @@ The expected deployment architecture is:
 
 ```text
 Cloud/VM
-   │
-   ├── Python environment
-   ├── Repository
-   ├── Environment variables
-   │      └── Roostoo API credentials
-   │
-   └── Live process
-          │
-          └── python -m rq.cli live
-                  │
-                  ├── 30m signal cycle
-                  ├── portfolio/risk state
-                  └── Roostoo orders
+   â”‚
+   â”œâ”€â”€ Python environment
+   â”œâ”€â”€ Repository
+   â”œâ”€â”€ Environment variables
+   â”‚      â””â”€â”€ Roostoo API credentials
+   â”‚
+   â””â”€â”€ Live process
+          â”‚
+          â””â”€â”€ python -m rq.cli live
+                  â”‚
+                  â”œâ”€â”€ 30m signal cycle
+                  â”œâ”€â”€ portfolio/risk state
+                  â””â”€â”€ Roostoo orders
 ```
 
 ---
@@ -1329,7 +1329,7 @@ Cloud/VM
 
 A production deployment should follow this order.
 
-## Step 1 — Pull the final repository
+## Step 1 â€” Pull the final repository
 
 ```bash
 git clone https://github.com/AmanQEDS/roostoo-quant-trading.git
@@ -1344,7 +1344,7 @@ git pull
 
 ---
 
-## Step 2 — Create the environment
+## Step 2 â€” Create the environment
 
 ```bash
 python -m venv .venv
@@ -1364,7 +1364,7 @@ source .venv/bin/activate
 
 ---
 
-## Step 3 — Install dependencies
+## Step 3 â€” Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -1372,7 +1372,7 @@ pip install -r requirements.txt
 
 ---
 
-## Step 4 — Configure credentials
+## Step 4 â€” Configure credentials
 
 Create the local environment configuration from `.env.example`.
 
@@ -1380,7 +1380,7 @@ Never commit the actual API key.
 
 ---
 
-## Step 5 — Verify the repository
+## Step 5 â€” Verify the repository
 
 ```bash
 python -m pytest -q
@@ -1394,7 +1394,7 @@ Expected:
 
 ---
 
-## Step 6 — Verify live configuration
+## Step 6 â€” Verify live configuration
 
 ```bash
 python -c "import yaml; print(yaml.safe_load(open('config/live.yaml')))"
@@ -1412,7 +1412,7 @@ timeframe=30m
 
 ---
 
-## Step 7 — Perform a dry run
+## Step 7 â€” Perform a dry run
 
 ```bash
 python -m rq.cli live --dry-run
@@ -1431,7 +1431,7 @@ Confirm:
 
 ---
 
-## Step 8 — Start production execution
+## Step 8 â€” Start production execution
 
 Once credentials and exchange permissions are verified:
 
@@ -1516,7 +1516,7 @@ For example:
 
 ```text
 1,354 trades
-≈ $8,546 fees
+â‰ˆ $8,546 fees
 ```
 
 in the representative allocation sweep.
@@ -1573,7 +1573,7 @@ The current live strategy is:
 
 ```text
 ==================================================
-Strategy:       EMA 50/200 crossover
+Strategy:             EMA 50/200 + Donchian(24)
 Frequency:      30 minutes
 Universe:       Roostoo crypto universe
 Direction:      Long only
@@ -1590,11 +1590,11 @@ Signal concept:
 
 ```text
 EMA(50) > EMA(200)
-        ↓
+        â†“
         Long candidate
 
 EMA(50) <= EMA(200)
-        ↓
+        â†“
         No long signal
 ```
 
@@ -1608,23 +1608,23 @@ The repository intentionally contains both experimental and production-oriented 
 
 ```text
 RESEARCH
-├── grid search
-├── walk-forward
-├── benchmarks
-├── cost sensitivity
-├── correlation sensitivity
-├── regime analysis
-├── risk tests
-├── sizing development
-└── distribution analysis
+â”œâ”€â”€ grid search
+â”œâ”€â”€ walk-forward
+â”œâ”€â”€ benchmarks
+â”œâ”€â”€ cost sensitivity
+â”œâ”€â”€ correlation sensitivity
+â”œâ”€â”€ regime analysis
+â”œâ”€â”€ risk tests
+â”œâ”€â”€ sizing development
+â””â”€â”€ distribution analysis
 
 PRODUCTION
-├── config/live.yaml
-├── rq/live/bot.py
-├── rq/roostoo/client.py
-├── rq/roostoo/universe.py
-├── execution
-└── state/risk handling
+â”œâ”€â”€ config/live.yaml
+â”œâ”€â”€ rq/live/bot.py
+â”œâ”€â”€ rq/roostoo/client.py
+â”œâ”€â”€ rq/roostoo/universe.py
+â”œâ”€â”€ execution
+â””â”€â”€ state/risk handling
 ```
 
 Research files should not be modified casually after the live configuration has been frozen.
@@ -1637,55 +1637,55 @@ Similarly, live execution code should not be changed simply to improve a histori
 
 A non-technical description of the system is:
 
-### Stage 1 — Find the tradable assets
+### Stage 1 â€” Find the tradable assets
 
 The system asks Roostoo what assets are actually available.
 
-### Stage 2 — Collect historical data
+### Stage 2 â€” Collect historical data
 
 Historical market data is downloaded and organized into a research panel.
 
-### Stage 3 — Check the data
+### Stage 3 â€” Check the data
 
 Missing bars, gaps and inconsistent data are investigated.
 
-### Stage 4 — Generate signals
+### Stage 4 â€” Generate signals
 
 The system calculates technical indicators and strategy signals.
 
-### Stage 5 — Simulate trading
+### Stage 5 â€” Simulate trading
 
 The backtest engine pretends to trade according to the strategy.
 
-### Stage 6 — Include realistic costs
+### Stage 6 â€” Include realistic costs
 
 Fees and slippage are included so that the results are not artificially optimistic.
 
-### Stage 7 — Test outside the development sample
+### Stage 7 â€” Test outside the development sample
 
 Walk-forward and validation procedures test whether the strategy continues to behave reasonably outside the research selection process.
 
-### Stage 8 — Test portfolio sizing
+### Stage 8 â€” Test portfolio sizing
 
 The system checks how much capital should be assigned to crypto and how large individual positions should be.
 
-### Stage 9 — Test risk
+### Stage 9 â€” Test risk
 
 Drawdown, volatility, downside risk and rolling return distributions are evaluated.
 
-### Stage 10 — Freeze the configuration
+### Stage 10 â€” Freeze the configuration
 
 The chosen strategy and parameters are explicitly recorded.
 
-### Stage 11 — Validate independently
+### Stage 11 â€” Validate independently
 
 The validation layer reconstructs portfolio/trade statistics and reports realized and unrealized P&L separately.
 
-### Stage 12 — Dry run
+### Stage 12 â€” Dry run
 
 The live bot connects to the exchange but only prints the orders it would send.
 
-### Stage 13 — Production execution
+### Stage 13 â€” Production execution
 
 The same signal logic is connected to actual Roostoo order execution.
 
@@ -1821,7 +1821,7 @@ The final recorded strategy/live-execution commit is:
 ecce954
 ```
 
-The repository was pushed successfully to GitHub.
+The repository should be treated as a versioned quantitative trading system and pushed only after validation.
 
 The project should be treated as a versioned quantitative trading system: changes to strategy parameters, risk settings, execution logic or accounting should be tested and committed separately rather than mixed into an uncontrolled live deployment.
 
@@ -1831,52 +1831,52 @@ The project should be treated as a versioned quantitative trading system: change
 
 ```text
                          ROOSTOO
-                            │
-                            ▼
-                    ┌───────────────┐
-                    │ Data + Ticker │
-                    └───────┬───────┘
-                            │
-                            ▼
-                    ┌───────────────┐
-                    │ Data Quality  │
-                    └───────┬───────┘
-                            │
-                            ▼
-                    ┌───────────────┐
-                    │  Indicators   │
-                    └───────┬───────┘
-                            │
-                            ▼
-                    ┌───────────────┐
-                    │ EMA 50 / 200  │
-                    └───────┬───────┘
-                            │
-                            ▼
-                    ┌───────────────┐
-                    │ Signal Ranking│
-                    └───────┬───────┘
-                            │
-                            ▼
-                 ┌──────────────────────┐
-                 │ Portfolio Constraints│
-                 │ max positions / size │
-                 └──────────┬───────────┘
-                            │
-                            ▼
-                 ┌──────────────────────┐
-                 │ Drawdown Risk Ladder │
-                 └──────────┬───────────┘
-                            │
-                            ▼
-                 ┌──────────────────────┐
-                 │ Order Construction   │
-                 └──────────┬───────────┘
-                            │
-                            ▼
+                            â”‚
+                            â–¼
+                    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                    â”‚ Data + Ticker â”‚
+                    â””â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
+                    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                    â”‚ Data Quality  â”‚
+                    â””â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
+                    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                    â”‚  Indicators   â”‚
+                    â””â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
+                    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                    â”‚ EMA 50 / 200  â”‚
+                    â””â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
+                    â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                    â”‚ Signal Rankingâ”‚
+                    â””â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
+                 â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                 â”‚ Portfolio Constraintsâ”‚
+                 â”‚ max positions / size â”‚
+                 â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
+                 â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                 â”‚ Drawdown Risk Ladder â”‚
+                 â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
+                 â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                 â”‚ Order Construction   â”‚
+                 â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¬â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+                            â”‚
+                            â–¼
                        ROOSTOO API
-                            │
-                            ▼
+                            â”‚
+                            â–¼
                        LIVE ORDERS
 ```
 

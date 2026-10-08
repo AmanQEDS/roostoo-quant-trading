@@ -47,6 +47,17 @@ def ma_cross(p, ext, fast=20, slow=50, kind="ema"):
     f, s = _ma(p.close, fast, kind), _ma(p.close, slow, kind)
     return Cond(f > s, f < s, f < s, f > s, score=f / s - 1)
 
+def ema_donchian(p, ext, fast=50, slow=200, n=24):
+    f, s = I.ema(p.close, fast), I.ema(p.close, slow)
+    hi, _ = I.donchian(p.high, p.low, n)
+    return Cond(
+        (f > s) & (p.close > hi),
+        f < s,
+        f < s,
+        f > s,
+        score=f / s - 1,
+    )
+
 def macd_sig(p, ext, fast=12, slow=26, sig=9):
     line, sg, h = I.macd(p.close, fast, slow, sig)
     return Cond(line > sg, line < sg, line < sg, line > sg, score=h / p.close)
@@ -185,14 +196,14 @@ def regime_switch(p, ext, trend_n=480, vol_hi=0.85, rsi_n=14, panic_rsi=30, use_
     return switch(R, {0: None, 1: ma_cross(p, ext, 20, 50), 2: rsi_mr(p, ext, rsi_n, 30, 50), 3: None})
 
 BUILDERS = {f.__name__: f for f in [
-    tsmom, xsmom, price_ma, ma_cross, macd_sig, adx_trend, rsi_mr, boll_mr, zscore_mr, ma_dist_mr,
+    tsmom, xsmom, price_ma, ma_cross, ema_donchian, macd_sig, adx_trend, rsi_mr, boll_mr, zscore_mr, ma_dist_mr,
     donchian_bo, vol_breakout, vol_filtered_trend, vix_gate, dvol_gate, fng_contrarian, fng_greed_gate,
     fng_momentum, flow_trend, volume_capitulation, absorption, rsi_boll, macd_trend, rsi_macd_boll,
     tech_sentiment, tech_vol_sent, regime_switch]}
 
 FAMILY = {
     "momentum": ["tsmom", "xsmom"],
-    "trend": ["price_ma", "ma_cross", "macd_sig", "adx_trend"],
+    "trend": ["price_ma", "ma_cross", "ema_donchian", "macd_sig", "adx_trend"],
     "mean_reversion": ["rsi_mr", "boll_mr", "zscore_mr", "ma_dist_mr"],
     "breakout": ["donchian_bo"],
     "volatility": ["vol_breakout", "vol_filtered_trend", "vix_gate", "dvol_gate"],
