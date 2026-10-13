@@ -26,6 +26,7 @@ from ..signals.core import to_target
 from ..research.runner import ALL_BUILDERS
 from .position_exits import position_exit_reason, short_trend_failure
 from .regime_filter import f2_regime
+from .x18 import completed_bars_held, x18_exit_reason
 
 log = logging.getLogger("bot")
 KL = "https://api.binance.com/api/v3/klines"
@@ -290,6 +291,8 @@ class Bot:
             end,
         )
 
+        self.current_signal_bar = p.index[-1]
+
         spec = self.cfg["strategies"]["crypto"]
 
         cond = ALL_BUILDERS[
@@ -447,6 +450,8 @@ class Bot:
         fee = TAKER_FEE
         exit_cfg = cfgl.get("position_exits") or {}
         position_exits_enabled = bool(exit_cfg.get("enabled", False))
+        x18_cfg = cfgl.get("x18") or {}
+        x18_enabled = bool(x18_cfg.get("enabled", False))
 
         def _qv(c, v):
             q = v["Free"] + v["Lock"]
@@ -555,10 +560,51 @@ class Bot:
         if not self.dry:
             self.save()
 
-        # Research-only per-position exits. Disabled unless explicitly enabled
-        # in config; live.yaml is intentionally unchanged.
+        # X18 has priority when explicitly enabled; legacy research exits remain
+        # available only when X18 is disabled.
         exit_reasons = {}
-        if position_exits_enabled:
+        if x18_enabled:
+            current_bar = getattr(self, "current_signal_bar", None)
+            for coin, qty in held.items():
+                meta = entries.get(coin, {})
+                entry_px = float(meta.get("entry_price") or 0)
+                pair = f"{coin}/USD"
+                sell_px = float(
+                    tick.get(pair, {}).get("MaxBid")
+                    or 0
+                )
+                if entry_px <= 0 or sell_px <= 0:
+                    log.warning(
+                        "X18 skipped for %s: missing entry cost basis or executable bid",
+                        coin,
+                    )
+                    continue
+
+                bars_held = completed_bars_held(
+                    meta.get("entry_signal_bar_ts") or meta.get("entry_ts"),
+                    current_bar,
+                    self.freq,
+                )
+                reason = x18_exit_reason(
+                    entry_price=entry_px,
+                    sell_price=sell_px,
+                    fee_rate=fee,
+                    bars_held=bars_held,
+                    hard_stop_net_pct=float(x18_cfg.get("hard_stop_net_pct", 0.08)),
+                    soft_time_bars=int(x18_cfg.get("soft_time_bars", 216)),
+                    soft_time_min_net_pct=float(
+                        x18_cfg.get("soft_time_min_net_pct", 0.015)
+                    ),
+                )
+                if reason:
+                    exit_reasons[coin] = reason
+                    log.warning(
+                        "X18_EXIT_TRIGGER %s reason=%s entry=%.8f bid=%.8f "
+                        "bars_held=%s",
+                        coin, reason, entry_px, sell_px, bars_held,
+                    )
+
+        elif position_exits_enabled:
             for coin, qty in held.items():
                 meta = entries.get(coin, {})
                 entry_px = float(meta.get("entry_price") or 0)
@@ -636,12 +682,26 @@ class Bot:
                     tick,
                     reason=sell_reason,
                 )
-                if position_exits_enabled and sold:
-                    cooldown_bars = max(0, int(exit_cfg.get("cooldown_bars", 2)))
-                    expires = pd.Timestamp.utcnow() + pd.Timedelta(
-                        minutes=self.freq * cooldown_bars
-                    )
-                    self.state.setdefault("exit_cooldowns", {})[coin] = expires.isoformat()
+                if sold and (
+                    (x18_enabled and triggered_reason in {"hard_stop_X18", "soft_time_X18"})
+                    or (position_exits_enabled and not x18_enabled)
+                ):
+                    if x18_enabled:
+                        cooldown_bars = max(0, int(x18_cfg.get("cooldown_bars", 3)))
+                        current_bar = getattr(self, "current_signal_bar", None)
+                        if current_bar is not None:
+                            until_bar = pd.Timestamp(current_bar) + pd.Timedelta(
+                                minutes=self.freq * cooldown_bars
+                            )
+                            self.state.setdefault("x18_cooldown_until_bar", {})[coin] = until_bar.isoformat()
+                        else:
+                            log.warning("X18 cooldown not persisted for %s: signal bar timestamp missing", coin)
+                    else:
+                        cooldown_bars = max(0, int(exit_cfg.get("cooldown_bars", 2)))
+                        expires = pd.Timestamp.now(tz="UTC") + pd.Timedelta(
+                            minutes=self.freq * cooldown_bars
+                        )
+                        self.state.setdefault("exit_cooldowns", {})[coin] = expires.isoformat()
                     self.save()
 
         if mode != "run":
@@ -667,6 +727,28 @@ class Bot:
         cooldown_now = pd.Timestamp.utcnow()
 
         def _cooldown_active(coin):
+            if x18_enabled:
+                expiry_raw = self.state.setdefault("x18_cooldown_until_bar", {}).get(coin)
+                current_bar = getattr(self, "current_signal_bar", None)
+                if not expiry_raw or current_bar is None:
+                    return False
+                try:
+                    expiry = pd.Timestamp(expiry_raw)
+                    now_bar = pd.Timestamp(current_bar)
+                    if expiry.tzinfo is None:
+                        expiry = expiry.tz_localize("UTC")
+                    else:
+                        expiry = expiry.tz_convert("UTC")
+                    if now_bar.tzinfo is None:
+                        now_bar = now_bar.tz_localize("UTC")
+                    else:
+                        now_bar = now_bar.tz_convert("UTC")
+                    if now_bar < expiry:
+                        return True
+                except (TypeError, ValueError):
+                    log.warning("invalid X18 bar cooldown for %s; clearing it", coin)
+                self.state.setdefault("x18_cooldown_until_bar", {}).pop(coin, None)
+                return False
             if not position_exits_enabled:
                 return False
             expiry_raw = cooldowns.get(coin)
@@ -861,7 +943,12 @@ class Bot:
         if side == "BUY":
             self.state.setdefault("entries", {})[coin] = {
                 "entry_price": fill_px,
-                "entry_ts": pd.Timestamp.utcnow().isoformat(),
+                "entry_ts": pd.Timestamp.now(tz="UTC").isoformat(),
+                "entry_signal_bar_ts": (
+                    pd.Timestamp(getattr(self, "current_signal_bar")).isoformat()
+                    if getattr(self, "current_signal_bar", None) is not None
+                    else None
+                ),
                 "peak_price_since_entry": fill_px,
                 "trough_price_since_entry": fill_px,
                 "mfe": 0.0,
