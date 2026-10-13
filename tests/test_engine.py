@@ -139,3 +139,13 @@ def test_x6_partial_take_profit_banks_half_and_keeps_a_trailing_remainder():
     remainder = r.trades[r.trades.reason == "protective_X6"].iloc[0]
     assert partial.qty == pytest.approx(remainder.qty)
     assert partial.pnl_net > 0
+
+
+def test_x0_is_identical_to_existing_signal_exit_baseline():
+    p = mini_panel({"A": [100, 102, 101, 108, 104, 103, 109]})
+    target = tgt(p, {"A": [1, 1, 1, 1, 1, 0, 0]})
+    baseline = run_backtest(p, target, cfg(pos_frac=0.5))
+    x0 = run_backtest(p, target, cfg(pos_frac=0.5), exit_config=ExitConfig(variant="X0"))
+    assert np.allclose(baseline.curve.equity_total, x0.curve.equity_total)
+    assert baseline.trades.pnl_net.tolist() == pytest.approx(x0.trades.pnl_net.tolist())
+    assert list(baseline.trades.reason) == list(x0.trades.reason)
