@@ -238,7 +238,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
             if rc.take_profit:
                 m = (side != 0) & (pnl >= rc.take_profit); force |= m; reason[m] = "tp"; blocked[m] = side[m]
         # Optional research-only stateful exits. Signals remain the original X0 targets.
-        if exit_config and exit_config.variant != "X0":
+        if exit_config and exit_config.variant != "X0" and not portfolio_lock_pending:
             v = exit_config.variant
             for j in np.flatnonzero(side == 1):
                 a = atr_values[i, j]
