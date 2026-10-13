@@ -25,6 +25,7 @@ from ..roostoo.client import RoostooClient
 from ..signals.core import to_target
 from ..research.runner import ALL_BUILDERS
 from .position_exits import position_exit_reason, short_trend_failure
+from .regime_filter import f2_regime
 
 log = logging.getLogger("bot")
 KL = "https://api.binance.com/api/v3/klines"
@@ -45,7 +46,7 @@ def update_peak_equity(state: dict, equity: float) -> float:
 class Feed:
     """Rolling 5m klines per crypto coin from Binance REST."""
 
-    def __init__(self, coins: list[str], warm_bars: int = 3000):
+    def __init__(self, coins: list[str], warm_bars: int = 9000):
         self.coins, self.warm, self.d = coins, warm_bars, {}
 
     def _fetch(self, sym, start_ms=None, limit=1000):
@@ -243,7 +244,9 @@ class Bot:
         )
         log.info("selected crypto: %s", self.coins)
 
-        self.feed = Feed(self.coins)
+        # BTC is also loaded as the F2 market-wide reference. It is not
+        # automatically added to the tradable strategy universe.
+        self.feed = Feed(list(dict.fromkeys(self.coins + ["BTC"])))
         self.freq = FREQ_MINUTES[self.cfg["timeframe"]]
 
     def save(self):
@@ -283,7 +286,7 @@ class Bot:
             good,
             None,
             self.freq,
-            end - pd.Timedelta(minutes=5 * 3000),
+            end - pd.Timedelta(minutes=5 * self.feed.warm),
             end,
         )
 
@@ -297,13 +300,28 @@ class Bot:
             **spec["params"],
         )
 
-        t = to_target(
-            cond,
-            self.cfg["allow_short"],
-        ).iloc[-1]
+        # Keep target/exit signals unchanged. F2 gates new orders in cycle(),
+        # rather than flattening existing positions when volatility rises.
+        filter_cfg = self.cfg.get("entry_filter") or {}
+        self.entry_allowed = True
+        if filter_cfg.get("f2_enabled", False):
+            f2 = f2_regime(
+                p.close,
+                reference_symbol=str(filter_cfg.get("reference_symbol", "BTC")),
+                window_days=int(filter_cfg.get("window_days", 14)),
+                bars_per_day=1440 // self.freq,
+            )
+            self.entry_allowed = bool(f2["allowed"])
+            log.info(
+                "F2 entry gate allowed=%s reason=%s high_vol=%s rv=%s median=%s",
+                self.entry_allowed, f2["reason"], f2["high_vol"],
+                f2["rv"], f2["median"],
+            )
 
+        targets = to_target(cond, self.cfg["allow_short"])
+        t = targets.reindex(columns=self.coins).iloc[-1]
         self.score = (
-            cond.score.iloc[-1]
+            cond.score.iloc[-1].reindex(self.coins)
             if cond.score is not None
             else pd.Series(dtype=float)
         )
@@ -675,6 +693,7 @@ class Bot:
                     v > 0
                     and c not in held
                     and c in crypto_coins
+                    and getattr(self, "entry_allowed", True)
                     and not _cooldown_active(c)
                 )
             ]
