@@ -29,6 +29,11 @@ log = logging.getLogger("bot")
 KL = "https://api.binance.com/api/v3/klines"
 
 
+def should_exit_held(coin, target, mode="run") -> bool:
+    """Held positions exit only on explicit flat signal or explicit liquidation mode."""
+    return mode == "liquidate" or (coin in target.index and target.get(coin, 0) <= 0)
+
+
 class Feed:
     """Rolling 5m klines per crypto coin from Binance REST."""
 
@@ -525,13 +530,7 @@ class Bot:
         # Existing equity positions are completely ignored.
         # ---------------------------------------------------------
         for coin, qty in held.items():
-            if (
-                mode == "liquidate"
-                or (
-                    coin in tgt.index
-                    and tgt.get(coin, 0) <= 0
-                )
-            ):
+            if should_exit_held(coin, tgt, mode):
                 pair = f"{coin}/USD"
 
                 self._order(
