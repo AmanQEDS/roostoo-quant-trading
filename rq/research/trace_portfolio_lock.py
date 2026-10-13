@@ -58,7 +58,7 @@ def main() -> None:
         path = out_dir / f"portfolio_lock_trace_slip_{int(slip)}bps.csv"
         events.to_csv(path, index=False)
 
-        print(f"\\n{'=' * 20} SLIPPAGE {slip:g} BPS {'=' * 20}")
+        print(f"\n{'=' * 20} SLIPPAGE {slip:g} BPS {'=' * 20}")
         print(
             f"return={rep['total_return']:+.2%}; Sharpe={rep['sharpe']:.3f}; "
             f"maxDD={rep['max_dd']:.2%}; trades={rep['n_trades']}; "
