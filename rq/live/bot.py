@@ -24,6 +24,7 @@ from ..execution import plan_entry, plan_exit
 from ..roostoo.client import RoostooClient
 from ..signals.core import to_target
 from ..research.runner import ALL_BUILDERS
+from .position_exits import position_exit_reason, short_trend_failure
 
 log = logging.getLogger("bot")
 KL = "https://api.binance.com/api/v3/klines"
@@ -426,6 +427,8 @@ class Bot:
         )
 
         fee = TAKER_FEE
+        exit_cfg = cfgl.get("position_exits") or {}
+        position_exits_enabled = bool(exit_cfg.get("enabled", False))
 
         def _qv(c, v):
             q = v["Free"] + v["Lock"]
@@ -534,6 +537,50 @@ class Bot:
         if not self.dry:
             self.save()
 
+        # Research-only per-position exits. Disabled unless explicitly enabled
+        # in config; live.yaml is intentionally unchanged.
+        exit_reasons = {}
+        if position_exits_enabled:
+            for coin, qty in held.items():
+                meta = entries.get(coin, {})
+                entry_px = float(meta.get("entry_price") or 0)
+                peak_px = float(meta.get("peak_price_since_entry") or 0)
+                pair = f"{coin}/USD"
+                sell_px = float(
+                    tick.get(pair, {}).get("MaxBid")
+                    or _px(coin)
+                    or 0
+                )
+                if entry_px <= 0 or peak_px <= 0 or sell_px <= 0:
+                    log.warning(
+                        "position exit rules skipped for %s: missing entry/peak/price metadata",
+                        coin,
+                    )
+                    continue
+                trend_failed = short_trend_failure(
+                    self.feed.d.get(coin),
+                    timeframe_minutes=self.freq,
+                    ema_span=int(exit_cfg.get("trend_ema_span", 10)),
+                )
+                reason = position_exit_reason(
+                    entry_price=entry_px,
+                    peak_price=peak_px,
+                    current_price=sell_px,
+                    fee_rate=fee,
+                    hard_loss_pct=float(exit_cfg.get("hard_loss_pct", 0.03)),
+                    trail_activation_net_pct=float(
+                        exit_cfg.get("trail_activation_net_pct", 0.05)
+                    ),
+                    giveback_fraction=float(exit_cfg.get("giveback_fraction", 0.50)),
+                    trend_failure=trend_failed,
+                )
+                if reason:
+                    exit_reasons[coin] = reason
+                    log.warning(
+                        "POSITION_EXIT_TRIGGER %s reason=%s entry=%.8f peak=%.8f bid=%.8f",
+                        coin, reason, entry_px, peak_px, sell_px,
+                    )
+
         log.info(
             "equity %.2f peak %.2f dd %.1f%% ladder_mult %.2f",
             eq,
@@ -548,10 +595,15 @@ class Bot:
         # Existing equity positions are completely ignored.
         # ---------------------------------------------------------
         for coin, qty in held.items():
-            if should_exit_held(coin, tgt, mode):
+            triggered_reason = exit_reasons.get(coin)
+            if triggered_reason or should_exit_held(coin, tgt, mode):
                 pair = f"{coin}/USD"
+                if mode == "liquidate":
+                    sell_reason = "SELL_OTHER"
+                else:
+                    sell_reason = triggered_reason or "SELL_SIGNAL_EXIT"
 
-                self._order(
+                sold = self._order(
                     coin,
                     "SELL",
                     plan_exit(
@@ -559,8 +611,15 @@ class Bot:
                         self.pairs[pair]["AmountPrecision"],
                     ),
                     tick,
-                    reason=("SELL_OTHER" if mode == "liquidate" else "SELL_SIGNAL_EXIT"),
+                    reason=sell_reason,
                 )
+                if position_exits_enabled and sold:
+                    cooldown_bars = max(0, int(exit_cfg.get("cooldown_bars", 2)))
+                    expires = pd.Timestamp.utcnow() + pd.Timedelta(
+                        minutes=self.freq * cooldown_bars
+                    )
+                    self.state.setdefault("exit_cooldowns", {})[coin] = expires.isoformat()
+                    self.save()
 
         if mode != "run":
             return
@@ -581,6 +640,28 @@ class Bot:
             ]
         )
 
+        cooldowns = self.state.setdefault("exit_cooldowns", {})
+        cooldown_now = pd.Timestamp.utcnow()
+
+        def _cooldown_active(coin):
+            if not position_exits_enabled:
+                return False
+            expiry_raw = cooldowns.get(coin)
+            if not expiry_raw:
+                return False
+            try:
+                expiry = pd.Timestamp(expiry_raw)
+                if expiry.tzinfo is None:
+                    expiry = expiry.tz_localize("UTC")
+                else:
+                    expiry = expiry.tz_convert("UTC")
+                if expiry > cooldown_now:
+                    return True
+            except (TypeError, ValueError):
+                log.warning("invalid exit cooldown for %s; clearing it", coin)
+            cooldowns.pop(coin, None)
+            return False
+
         for coin in self._rank(
             [
                 c
@@ -589,6 +670,7 @@ class Bot:
                     v > 0
                     and c not in held
                     and c in crypto_coins
+                    and not _cooldown_active(c)
                 )
             ]
         ):
