@@ -149,3 +149,54 @@ def test_x0_is_identical_to_existing_signal_exit_baseline():
     assert np.allclose(baseline.curve.equity_total, x0.curve.equity_total)
     assert baseline.trades.pnl_net.tolist() == pytest.approx(x0.trades.pnl_net.tolist())
     assert list(baseline.trades.reason) == list(x0.trades.reason)
+
+def test_portfolio_profit_lock_exits_and_requires_signal_reset_before_reentry():
+    p = mini_panel({"A": [100, 100, 110, 110, 105, 105, 105, 105, 105, 105, 105, 105, 105, 105]})
+    target = tgt(p, {"A": [1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1]})
+    lock = ExitConfig(
+        portfolio_lock_enabled=True,
+        portfolio_lock_activation=500,
+        portfolio_lock_giveback=0.45,
+        portfolio_lock_cooldown_bars=3,
+    )
+
+    r = run_backtest(p, target, cfg(pos_frac=1.0), exit_config=lock)
+
+    assert len(r.trades) == 1
+    assert r.trades.iloc[0].reason == "portfolio_profit_lock"
+    assert r.trades.iloc[0].pnl_net == pytest.approx(5_000.0)
+    # The original long signal remains active on bar 5, so the lock must not
+    # immediately buy back the position. A signal reset then permits a later entry.
+    assert r.curve.n_pos.iloc[5:9].sum() == 0
+    assert r.curve.n_pos.iloc[10] == 1
+    assert len(r.open_positions) == 1
+
+
+def test_portfolio_profit_lock_retries_untradable_exit_and_starts_cooldown_after_flat():
+    p0 = mini_panel({"A": [100, 100, 110, 110, 105, 100, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95]})
+    tradable = pd.DataFrame(True, index=p0.index, columns=["A"])
+    tradable.iloc[4:6] = False
+    p = mini_panel(
+        {"A": [100, 100, 110, 110, 105, 100, 95, 95, 95, 95, 95, 95, 95, 95, 95, 95]},
+        tradable=tradable,
+    )
+    target = tgt(p, {"A": [1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]})
+    lock = ExitConfig(
+        portfolio_lock_enabled=True,
+        portfolio_lock_activation=500,
+        portfolio_lock_giveback=0.45,
+        portfolio_lock_cooldown_bars=3,
+    )
+
+    r = run_backtest(p, target, cfg(pos_frac=1.0), exit_config=lock)
+
+    assert len(r.trades) == 1
+    assert r.trades.iloc[0].reason == "portfolio_profit_lock"
+    # The lock triggers while untradable, but the exit is retried at the first
+    # tradable bar. Cooldown begins after that actual liquidation.
+    assert r.trades.iloc[0].pnl_net == pytest.approx(-5_000.0)
+    assert r.curve.n_pos.iloc[9] == 0
+    assert r.curve.n_pos.iloc[10] == 0
+    assert r.curve.n_pos.iloc[11] == 1
+    assert len(r.open_positions) == 1
+
