@@ -54,6 +54,15 @@ def evaluate_one(panel, ext, spec, pcfg, start, end, config, split):
         panel, spec, ext, pcfg, start, end, "30m", exit_config=config
     )
     curve = res.curve
+    lock_exits = (
+        res.trades["reason"].eq("portfolio_profit_lock")
+        if not res.trades.empty and "reason" in res.trades.columns
+        else pd.Series(dtype=bool)
+    )
+    lock_exit_count = int(lock_exits.sum())
+    lock_exit_net_pnl = (
+        float(res.trades.loc[lock_exits, "pnl_net"].sum()) if lock_exit_count else 0.0
+    )
     row = {
         "split": split,
         "config": label(config),
@@ -76,8 +85,11 @@ def evaluate_one(panel, ext, spec, pcfg, start, end, config, split):
         "max_dd_daily": rep.get("max_dd"),
         "max_dd_bar": float(curve["drawdown"].min()) if len(curve) else float("nan"),
         "trades": rep.get("n_trades"),
+        "portfolio_lock_closed_positions": lock_exit_count,
+        "portfolio_lock_exit_net_pnl": lock_exit_net_pnl,
         "fees_paid": rep.get("fees_paid", res.fees),
         "turnover_usd": res.turnover_usd,
+        "turnover_to_starting_capital": res.turnover_usd / pcfg.capital,
         "composite": rep.get("composite"),
     }
     return row
@@ -187,7 +199,9 @@ def main():
     print(
         costs[[
             "config", "fee", "crypto_slip_bps", "total_return", "sharpe",
-            "max_dd_daily", "trades", "fees_paid", "turnover_usd"
+            "max_dd_daily", "trades", "portfolio_lock_closed_positions",
+            "portfolio_lock_exit_net_pnl", "fees_paid", "turnover_usd",
+            "turnover_to_starting_capital"
         ]].to_string(index=False)
     )
 
