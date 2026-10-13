@@ -52,6 +52,11 @@ class ExitConfig:
     donchian_n: int = 24
     partial_r: float = 1.5
     cooldown_bars: int = 6
+    # Portfolio-level profit lock is opt-in and research-only by default.
+    portfolio_lock_enabled: bool = False
+    portfolio_lock_activation: float = 500.0
+    portfolio_lock_giveback: float = 0.35
+    portfolio_lock_cooldown_bars: int = 6
 
     def __post_init__(self):
         if self.variant not in {f"X{i}" for i in range(8)}:
@@ -62,6 +67,12 @@ class ExitConfig:
             raise ValueError("invalid trailing-stop parameters")
         if not 0 < self.giveback_fraction < 1 or self.giveback_trigger_atr <= 0:
             raise ValueError("invalid giveback parameters")
+        if self.portfolio_lock_activation <= 0:
+            raise ValueError("portfolio_lock_activation must be positive")
+        if not 0 < self.portfolio_lock_giveback < 1:
+            raise ValueError("portfolio_lock_giveback must be between 0 and 1")
+        if self.portfolio_lock_cooldown_bars < 1:
+            raise ValueError("portfolio_lock_cooldown_bars must be at least 1")
 
 
 @dataclass
@@ -114,6 +125,12 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     next_trade_id = 1
     halt_until = -1
     peak = pcfg.capital
+    # Each lock cycle starts from its own equity baseline. After a lock fires,
+    # a fresh activation-sized gain is required before another lock can fire.
+    lock_cycle_base = pcfg.capital
+    lock_cycle_peak = pcfg.capital
+    lock_armed = False
+    portfolio_lock_pending = False
     fees_total = turnover = realized_total = 0.0
     skipped = {"cap_pos": 0, "min_order": 0, "corr": 0, "exposure": 0, "no_cash": 0}
     trades: list[dict] = []
@@ -193,8 +210,37 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
             break
         peak = max(peak, tot); dd = 1 - tot / peak
 
+        # --- optional portfolio-level profit lock (research-only unless explicitly enabled)
+        if portfolio_lock_pending and not (side != 0).any():
+            portfolio_lock_pending = False
+        portfolio_lock_trigger = False
+        if exit_config and exit_config.portfolio_lock_enabled and not portfolio_lock_pending:
+            # Estimate liquidation equity net of closing fee and slippage; the
+            # actual fill can still differ when the next execution price gaps.
+            estimated_exit_cost = float((np.abs(q * px) * (fee + slip)).sum())
+            net_liquidation_equity = float(tot - estimated_exit_cost)
+            if not lock_armed:
+                if net_liquidation_equity - lock_cycle_base >= exit_config.portfolio_lock_activation:
+                    lock_armed = True
+                    lock_cycle_peak = net_liquidation_equity
+            else:
+                lock_cycle_peak = max(lock_cycle_peak, net_liquidation_equity)
+                peak_profit = lock_cycle_peak - lock_cycle_base
+                lock_floor = lock_cycle_base + peak_profit * (1.0 - exit_config.portfolio_lock_giveback)
+                if net_liquidation_equity <= lock_floor:
+                    portfolio_lock_trigger = True
+                    lock_armed = False
+                    lock_cycle_base = net_liquidation_equity
+                    lock_cycle_peak = net_liquidation_equity
+                    portfolio_lock_pending = True
+
         # --- risk exits decided on information at close i
         force = np.zeros(N, bool); reason = np.array([""] * N, dtype=object)
+        if portfolio_lock_trigger:
+            active = side != 0
+            force |= active
+            reason[active] = "portfolio_profit_lock"
+            halt_until = max(halt_until, i + exit_config.portfolio_lock_cooldown_bars)
         if (rc.stop_loss or rc.take_profit) and (side != 0).any():
             pnl = np.where(side != 0, side * (px / np.where(entry > 0, entry, np.nan) - 1), 0.0)
             if rc.stop_loss:
@@ -268,7 +314,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                     blocked[j] = side[j]
                     cooldown_until[j] = i + exit_config.cooldown_bars
 
-        halted = i < halt_until
+        halted = (i < halt_until) or portfolio_lock_pending
         if rc.dd_halt and dd >= rc.dd_halt and not halted:
             halt_until = i + rc.halt_bars                # pause new entries for halt_bars
             force |= side != 0; reason[side != 0] = "halt"
