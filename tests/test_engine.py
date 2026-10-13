@@ -1,5 +1,5 @@
 import numpy as np, pandas as pd, pytest
-from rq.backtest.engine import run_backtest, PortfolioConfig
+from rq.backtest.engine import run_backtest, PortfolioConfig, ExitConfig
 from rq.backtest.audit import export_backtest_audit
 from rq.backtest.metrics import perf_report
 from rq.backtest.risk import RiskConfig
@@ -95,3 +95,34 @@ def test_audit_exports_reconcile_completed_and_open_positions(tmp_path):
 
     with pytest.raises(ValueError, match="trade count"):
         export_backtest_audit(result, 100_000, report["n_trades"] + 1, "bad_count", tmp_path)
+
+
+def test_drawdown_ladder_does_not_force_sell_existing_positions():
+    p = mini_panel({"A": [100, 100, 80, 80, 80, 80], "B": [100] * 6})
+    target = tgt(p, {"A": [1, 1, 1, 1, 1, 1], "B": [0, 0, 1, 1, 1, 1]})
+    r = run_backtest(
+        p, target,
+        cfg(pos_frac=0.5, max_pos={"crypto": 5, "equity": 5},
+            risk=RiskConfig(dd_ladder=((0.10, 0.5),))),
+    )
+    # The existing A position remains open despite the portfolio drawdown.
+    assert not ((r.trades.asset == "A") & (r.trades.reason == "signal")).any()
+    assert any(pos["asset"] == "A" for pos in r.open_positions)
+    # B is a new entry after the drawdown and must be sized below A's initial notional.
+    b = r.trades[r.trades.asset == "B"]
+    assert len(b) == 1
+    assert b.iloc[0].entry_px * b.iloc[0].qty < 0.5 * 100_000
+
+
+def test_x3_trailing_exit_records_mfe_mae_and_giveback():
+    p = mini_panel({"A": [100, 100, 120, 110, 100, 100, 100]})
+    target = tgt(p, {"A": [1, 1, 1, 1, 1, 0, 0]})
+    r = run_backtest(p, target, cfg(pos_frac=0.5),
+                     exit_config=ExitConfig(variant="X3", trailing_pct=0.05))
+    stopped = r.trades[r.trades.reason == "protective_X3"]
+    assert len(stopped) == 1
+    trade = stopped.iloc[0]
+    assert trade.mfe > 0
+    assert trade.mae <= 0
+    assert trade.giveback == pytest.approx(trade.mfe - trade.pnl_net)
+    assert bool(trade.profitable_1atr_loser) == (trade.mfe >= trade.qty * trade.entry_atr and trade.pnl_net < 0)
