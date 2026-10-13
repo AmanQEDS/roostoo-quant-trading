@@ -165,6 +165,11 @@ def test_portfolio_profit_lock_exits_and_requires_signal_reset_before_reentry():
     assert len(r.trades) == 1
     assert r.trades.iloc[0].reason == "portfolio_profit_lock"
     assert r.trades.iloc[0].pnl_net == pytest.approx(5_000.0)
+    event_types = [event["event"] for event in r.lock_events]
+    assert "activated" in event_types
+    assert "triggered" in event_types
+    assert "liquidation_complete" in event_types
+    assert event_types.index("triggered") < event_types.index("liquidation_complete")
     # The original long signal remains active on bar 5, so the lock must not
     # immediately buy back the position. A signal reset then permits a later entry.
     assert r.curve.n_pos.iloc[5:9].sum() == 0
@@ -195,6 +200,12 @@ def test_portfolio_profit_lock_retries_untradable_exit_and_starts_cooldown_after
     # The lock triggers while untradable, but the exit is retried at the first
     # tradable bar. Cooldown begins after that actual liquidation.
     assert r.trades.iloc[0].pnl_net == pytest.approx(-5_000.0)
+    event_types = [event["event"] for event in r.lock_events]
+    assert "triggered" in event_types
+    assert "liquidation_complete" in event_types
+    trigger_i = event_types.index("triggered")
+    complete_i = event_types.index("liquidation_complete")
+    assert r.lock_events[trigger_i]["bar_index"] < r.lock_events[complete_i]["bar_index"]
     assert r.curve.n_pos.iloc[9] == 0
     assert r.curve.n_pos.iloc[10] == 0
     assert r.curve.n_pos.iloc[11] == 1
