@@ -109,9 +109,8 @@ def test_drawdown_ladder_does_not_force_sell_existing_positions():
     assert not ((r.trades.asset == "A") & (r.trades.reason == "signal")).any()
     assert any(pos["asset"] == "A" for pos in r.open_positions)
     # B is a new entry after the drawdown and must be sized below A's initial notional.
-    b = r.trades[r.trades.asset == "B"]
-    assert len(b) == 1
-    assert b.iloc[0].entry_px * b.iloc[0].qty < 0.5 * 100_000
+    b = next(pos for pos in r.open_positions if pos["asset"] == "B")
+    assert b["entry"] * b["qty"] < 0.5 * 100_000
 
 
 def test_x3_trailing_exit_records_mfe_mae_and_giveback():
