@@ -167,6 +167,11 @@ class Bot:
                 "entries": {},
             }
         )
+        self.state.setdefault("entries", {})
+        self.order_context = {
+            "equity": None, "peak_equity": None,
+            "drawdown": None, "dd_multiplier": None,
+        }
 
         # IMPORTANT:
         # Only Roostoo assets explicitly classified as crypto are
@@ -482,6 +487,30 @@ class Bot:
             if dd >= th:
                 mult = m
 
+        self.order_context = {
+            "equity": float(eq),
+            "peak_equity": float(peak),
+            "drawdown": float(dd),
+            "dd_multiplier": float(mult),
+        }
+
+        # Update per-position excursions before any exit order is considered.
+        entries = self.state.setdefault("entries", {})
+        for coin, qty in held.items():
+            meta = entries.get(coin)
+            px = _px(coin)
+            if not meta or not meta.get("entry_price") or px <= 0:
+                continue
+            meta["peak_price_since_entry"] = max(float(meta.get("peak_price_since_entry", meta["entry_price"])), px)
+            meta["trough_price_since_entry"] = min(float(meta.get("trough_price_since_entry", meta["entry_price"])), px)
+            entry_px = float(meta["entry_price"])
+            meta["mfe"] = max(float(meta.get("mfe", 0.0)), (meta["peak_price_since_entry"] - entry_px) * float(qty))
+            meta["mae"] = min(float(meta.get("mae", 0.0)), (meta["trough_price_since_entry"] - entry_px) * float(qty))
+            meta["last_price"] = px
+            meta["last_unrealized_pnl"] = (px - entry_px) * float(qty)
+        if not self.dry:
+            self.save()
+
         log.info(
             "equity %.2f peak %.2f dd %.1f%% ladder_mult %.2f",
             eq,
@@ -513,6 +542,7 @@ class Bot:
                         self.pairs[pair]["AmountPrecision"],
                     ),
                     tick,
+                    reason=("SELL_OTHER" if mode == "liquidate" else "SELL_SIGNAL_EXIT"),
                 )
 
         if mode != "run":
@@ -570,6 +600,7 @@ class Bot:
                     "BUY",
                     q,
                     tick,
+                    reason="BUY_NEW_ENTRY",
                 )
             ):
                 n_open += 1
@@ -609,6 +640,7 @@ class Bot:
         side,
         qty,
         tick,
+        reason=None,
     ) -> bool:
         # Final safety guard: this bot may only trade crypto.
         pair_info = self.pairs.get(
@@ -630,6 +662,35 @@ class Bot:
 
         if qty <= 0:
             return False
+
+        meta = self.state.setdefault("entries", {}).get(coin, {})
+        last_price = float(
+            tick.get(pair, {}).get("LastPrice")
+            or tick.get(pair, {}).get("MaxBid")
+            or tick.get(pair, {}).get("MinAsk")
+            or 0
+        )
+        entry_price = meta.get("entry_price")
+        unrealized = (
+            (last_price - float(entry_price)) * float(qty)
+            if entry_price is not None and side == "SELL"
+            else None
+        )
+        reason = reason or ("BUY_NEW_ENTRY" if side == "BUY" else "SELL_OTHER")
+        log.info(
+            "ORDER_INTENT %s",
+            json.dumps({
+                "ts": pd.Timestamp.utcnow().isoformat(),
+                "symbol": pair, "side": side, "qty": qty, "reason": reason,
+                "entry_price": entry_price, "entry_ts": meta.get("entry_ts"),
+                "last_price": last_price or None, "unrealized_pnl": unrealized,
+                "peak_price_since_entry": meta.get("peak_price_since_entry"),
+                "equity": self.order_context.get("equity"),
+                "peak_equity": self.order_context.get("peak_equity"),
+                "drawdown": self.order_context.get("drawdown"),
+                "dd_multiplier": self.order_context.get("dd_multiplier"),
+            }, sort_keys=True),
+        )
 
         if self.dry:
             log.info(
@@ -670,6 +731,19 @@ class Bot:
             if side == "SELL"
             else -(notional + fee)
         )
+
+        if side == "BUY":
+            fill_px = float(d.get("FilledAverPrice") or last_price or 0)
+            self.state.setdefault("entries", {})[coin] = {
+                "entry_price": fill_px,
+                "entry_ts": pd.Timestamp.utcnow().isoformat(),
+                "peak_price_since_entry": fill_px,
+                "trough_price_since_entry": fill_px,
+                "mfe": 0.0,
+                "mae": 0.0,
+            }
+        elif side == "SELL":
+            self.state.setdefault("entries", {}).pop(coin, None)
 
         self.save()
 
