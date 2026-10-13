@@ -15,7 +15,7 @@ entry_filter:
   reference_symbol: BTC
   window_days: 14
 x18:
-  enabled: false
+  enabled: true
   hard_stop_net_pct: 0.08
   soft_time_bars: 216
   soft_time_min_net_pct: 0.015
