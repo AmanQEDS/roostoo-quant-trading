@@ -333,6 +333,22 @@ class Bot:
             if qty <= 0:
                 continue
 
+            log.info(
+                "ORDER_INTENT %s",
+                json.dumps({
+                    "ts": pd.Timestamp.utcnow().isoformat(),
+                    "symbol": pair, "side": "SELL", "qty": qty,
+                    "reason": "SELL_EQUITY_LIQ", "entry_price": None,
+                    "entry_ts": None, "last_price": tick.get(pair, {}).get("LastPrice"),
+                    "unrealized_pnl": None, "peak_price_since_entry": None,
+                    "mfe": None, "mae": None,
+                    "equity": self.order_context.get("equity"),
+                    "peak_equity": self.order_context.get("peak_equity"),
+                    "drawdown": self.order_context.get("drawdown"),
+                    "dd_multiplier": self.order_context.get("dd_multiplier"),
+                }, sort_keys=True),
+            )
+
             if self.dry:
                 log.info(
                     "[dry-run] LIQUIDATE EXISTING EQUITY %s %s",
