@@ -44,11 +44,36 @@ def evaluate(panel_full, spec: Spec, ext: dict, pcfg: PortfolioConfig, start, en
     rep = perf_report(res, panel_full.freq_min, pcfg.capital)
     rep.update(rolling_window_report(res.curve["equity_total"], 14))
     if not res.trades.empty:
-        for source, target in (("mfe", "avg_mfe"), ("mae", "avg_mae"), ("giveback", "avg_giveback")):
-            if source in res.trades:
-                rep[target] = float(res.trades[source].mean())
-        if "profitable_1atr_loser" in res.trades:
-            rep["pct_1atr_profit_then_loser"] = float(res.trades["profitable_1atr_loser"].mean() * 100)
+        # X6 creates two execution tranches for one original position. Aggregate
+        # by stable position_id so trade counts and giveback rates stay position-level.
+        grouped = res.trades.groupby("position_id", dropna=False).agg(
+            net_pnl=("pnl_net", "sum"),
+            mfe=("mfe", "sum"),
+            mae=("mae", "sum"),
+            entry_atr=("entry_atr", "first"),
+            initial_qty=("position_initial_qty", "first"),
+            holding_period_hours=("holding_period_hours", "max"),
+        )
+        grouped["giveback"] = grouped["mfe"] - grouped["net_pnl"]
+        wins = grouped.loc[grouped.net_pnl > 0, "net_pnl"]
+        losses = grouped.loc[grouped.net_pnl <= 0, "net_pnl"]
+        rep["n_trades"] = int(len(grouped))
+        rep["win_rate"] = float((grouped.net_pnl > 0).mean())
+        rep["profit_factor"] = float(wins.sum() / abs(losses.sum())) if losses.sum() < 0 else float("inf")
+        rep["avg_win"] = float(wins.mean()) if len(wins) else 0.0
+        rep["avg_loss"] = float(losses.mean()) if len(losses) else 0.0
+        rep["avg_hold_h"] = float(grouped.holding_period_hours.mean())
+        rep["trades_per_day"] = len(grouped) / max(float(rep.get("span_days", 1)), 1.0)
+        rep["avg_mfe"] = float(grouped.mfe.mean())
+        rep["avg_mae"] = float(grouped.mae.mean())
+        rep["avg_giveback"] = float(grouped.giveback.mean())
+        eligible = grouped.entry_atr.notna() & grouped.initial_qty.notna()
+        profitable_then_loser = (
+            (grouped.mfe >= grouped.initial_qty * grouped.entry_atr)
+            & (grouped.net_pnl < 0)
+            & eligible
+        )
+        rep["pct_1atr_profit_then_loser"] = float(profitable_then_loser.sum() / max(int(eligible.sum()), 1) * 100)
     else:
         rep.update(avg_mfe=0.0, avg_mae=0.0, avg_giveback=0.0, pct_1atr_profit_then_loser=0.0)
     return res, rep
