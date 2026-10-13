@@ -151,9 +151,9 @@ def generate(lines, date):
                 "entry_price": fill["price"],
                 "entry_ts": fill.get("ts"),
                 "qty": fill["qty"],
-                "mfe": float(intent.get("mfe", 0.0) or 0.0),
-                "mae": float(intent.get("mae", 0.0) or 0.0),
-                "peak_price": intent.get("peak_price_since_entry", fill["price"]),
+                "mfe": float(intent["mfe"]) if intent.get("mfe") is not None else None,
+                "mae": float(intent["mae"]) if intent.get("mae") is not None else None,
+                "peak_price": intent.get("peak_price_since_entry"),
             }
         elif fill["side"] == "SELL":
             trade = open_trades.pop(fill["pair"], None)
@@ -161,11 +161,14 @@ def generate(lines, date):
             intent = candidates.pop(0) if candidates else {}
             entry_px = (trade or {}).get("entry_price")
             final_pnl = (fill["price"] - entry_px) * min(fill["qty"], (trade or {}).get("qty", fill["qty"])) if entry_px else None
-            mfe = intent.get("mfe", (trade or {}).get("mfe"))
-            mae = intent.get("mae", (trade or {}).get("mae"))
-            if entry_px and trade:
-                mfe = max(float(mfe or 0.0), (float(intent.get("peak_price_since_entry") or (trade.get("peak_price") or entry_px)) - entry_px) * min(fill["qty"], trade["qty"]))
-                mae = float(mae or 0.0)
+            mfe = intent.get("mfe") if intent.get("mfe") is not None else (trade or {}).get("mfe")
+            mae = intent.get("mae") if intent.get("mae") is not None else (trade or {}).get("mae")
+            peak_px = intent.get("peak_price_since_entry")
+            if peak_px is None and trade:
+                peak_px = trade.get("peak_price")
+            if entry_px and trade and peak_px is not None:
+                peak_mfe = (float(peak_px) - entry_px) * min(fill["qty"], trade["qty"])
+                mfe = max(float(mfe), peak_mfe) if mfe is not None else peak_mfe
             excursions.append({
                 "pair": fill["pair"], "final_pnl": final_pnl,
                 "mfe": float(mfe) if mfe is not None else None,
