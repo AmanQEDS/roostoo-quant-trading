@@ -24,15 +24,30 @@ from ..execution import plan_entry, plan_exit
 from ..roostoo.client import RoostooClient
 from ..signals.core import to_target
 from ..research.runner import ALL_BUILDERS
+from .position_exits import position_exit_reason, short_trend_failure
+from .regime_filter import f2_regime
+from .x18 import completed_bars_held, x18_exit_reason
 
 log = logging.getLogger("bot")
 KL = "https://api.binance.com/api/v3/klines"
 
 
+def should_exit_held(coin, target, mode="run") -> bool:
+    """Held positions exit only on explicit flat signal or explicit liquidation mode."""
+    return mode == "liquidate" or (coin in target.index and target.get(coin, 0) <= 0)
+
+
+def update_peak_equity(state: dict, equity: float) -> float:
+    """Keep the historical equity high-water mark monotonic across cycles/restarts."""
+    peak = max(float(state.get("peak", equity)), float(equity))
+    state["peak"] = peak
+    return peak
+
+
 class Feed:
     """Rolling 5m klines per crypto coin from Binance REST."""
 
-    def __init__(self, coins: list[str], warm_bars: int = 3000):
+    def __init__(self, coins: list[str], warm_bars: int = 9000):
         self.coins, self.warm, self.d = coins, warm_bars, {}
 
     def _fetch(self, sym, start_ms=None, limit=1000):
@@ -167,6 +182,11 @@ class Bot:
                 "entries": {},
             }
         )
+        self.state.setdefault("entries", {})
+        self.order_context = {
+            "equity": None, "peak_equity": None,
+            "drawdown": None, "dd_multiplier": None,
+        }
 
         # IMPORTANT:
         # Only Roostoo assets explicitly classified as crypto are
@@ -225,7 +245,9 @@ class Bot:
         )
         log.info("selected crypto: %s", self.coins)
 
-        self.feed = Feed(self.coins)
+        # BTC is also loaded as the F2 market-wide reference. It is not
+        # automatically added to the tradable strategy universe.
+        self.feed = Feed(list(dict.fromkeys(self.coins + ["BTC"])))
         self.freq = FREQ_MINUTES[self.cfg["timeframe"]]
 
     def save(self):
@@ -265,9 +287,11 @@ class Bot:
             good,
             None,
             self.freq,
-            end - pd.Timedelta(minutes=5 * 3000),
+            end - pd.Timedelta(minutes=5 * self.feed.warm),
             end,
         )
+
+        self.current_signal_bar = p.index[-1]
 
         spec = self.cfg["strategies"]["crypto"]
 
@@ -279,13 +303,28 @@ class Bot:
             **spec["params"],
         )
 
-        t = to_target(
-            cond,
-            self.cfg["allow_short"],
-        ).iloc[-1]
+        # Keep target/exit signals unchanged. F2 gates new orders in cycle(),
+        # rather than flattening existing positions when volatility rises.
+        filter_cfg = self.cfg.get("entry_filter") or {}
+        self.entry_allowed = True
+        if filter_cfg.get("f2_enabled", False):
+            f2 = f2_regime(
+                p.close,
+                reference_symbol=str(filter_cfg.get("reference_symbol", "BTC")),
+                window_days=int(filter_cfg.get("window_days", 14)),
+                bars_per_day=1440 // self.freq,
+            )
+            self.entry_allowed = bool(f2["allowed"])
+            log.info(
+                "F2 entry gate allowed=%s reason=%s high_vol=%s rv=%s median=%s",
+                self.entry_allowed, f2["reason"], f2["high_vol"],
+                f2["rv"], f2["median"],
+            )
 
+        targets = to_target(cond, self.cfg["allow_short"])
+        t = targets.reindex(columns=self.coins).iloc[-1]
         self.score = (
-            cond.score.iloc[-1]
+            cond.score.iloc[-1].reindex(self.coins)
             if cond.score is not None
             else pd.Series(dtype=float)
         )
@@ -322,6 +361,22 @@ class Bot:
 
             if qty <= 0:
                 continue
+
+            log.info(
+                "ORDER_INTENT %s",
+                json.dumps({
+                    "ts": pd.Timestamp.utcnow().isoformat(),
+                    "symbol": pair, "side": "SELL", "qty": qty,
+                    "reason": "SELL_EQUITY_LIQ", "entry_price": None,
+                    "entry_ts": None, "last_price": tick.get(pair, {}).get("LastPrice"),
+                    "unrealized_pnl": None, "peak_price_since_entry": None,
+                    "mfe": None, "mae": None,
+                    "equity": self.order_context.get("equity"),
+                    "peak_equity": self.order_context.get("peak_equity"),
+                    "drawdown": self.order_context.get("drawdown"),
+                    "dd_multiplier": self.order_context.get("dd_multiplier"),
+                }, sort_keys=True),
+            )
 
             if self.dry:
                 log.info(
@@ -393,6 +448,10 @@ class Bot:
         )
 
         fee = TAKER_FEE
+        exit_cfg = cfgl.get("position_exits") or {}
+        position_exits_enabled = bool(exit_cfg.get("enabled", False))
+        x18_cfg = cfgl.get("x18") or {}
+        x18_enabled = bool(x18_cfg.get("enabled", False))
 
         def _qv(c, v):
             q = v["Free"] + v["Lock"]
@@ -458,12 +517,7 @@ class Bot:
             )
         )
 
-        peak = max(
-            self.state.get("peak", eq),
-            eq,
-        )
-
-        self.state["peak"] = peak
+        peak = update_peak_equity(self.state, eq)
 
         if not self.dry:
             self.save()
@@ -482,6 +536,120 @@ class Bot:
             if dd >= th:
                 mult = m
 
+        self.order_context = {
+            "equity": float(eq),
+            "peak_equity": float(peak),
+            "drawdown": float(dd),
+            "dd_multiplier": float(mult),
+        }
+
+        # Update per-position excursions before any exit order is considered.
+        entries = self.state.setdefault("entries", {})
+        for coin, qty in held.items():
+            meta = entries.get(coin)
+            px = _px(coin)
+            if not meta or not meta.get("entry_price") or px <= 0:
+                continue
+            meta["peak_price_since_entry"] = max(float(meta.get("peak_price_since_entry", meta["entry_price"])), px)
+            meta["trough_price_since_entry"] = min(float(meta.get("trough_price_since_entry", meta["entry_price"])), px)
+            entry_px = float(meta["entry_price"])
+            meta["mfe"] = max(float(meta.get("mfe", 0.0)), (meta["peak_price_since_entry"] - entry_px) * float(qty))
+            meta["mae"] = min(float(meta.get("mae", 0.0)), (meta["trough_price_since_entry"] - entry_px) * float(qty))
+            meta["last_price"] = px
+            meta["last_unrealized_pnl"] = (px - entry_px) * float(qty)
+        if not self.dry:
+            self.save()
+
+        # X18 has priority when explicitly enabled; legacy research exits remain
+        # available only when X18 is disabled.
+        exit_reasons = {}
+        if x18_enabled:
+            current_bar = getattr(self, "current_signal_bar", None)
+            for coin, qty in held.items():
+                meta = entries.get(coin, {})
+                entry_px = float(meta.get("entry_price") or 0)
+                pair = f"{coin}/USD"
+                sell_px = float(
+                    tick.get(pair, {}).get("MaxBid")
+                    or 0
+                )
+                if entry_px <= 0 or sell_px <= 0:
+                    log.warning(
+                        "X18 skipped for %s: missing entry cost basis or executable bid",
+                        coin,
+                    )
+                    continue
+
+                bars_held = completed_bars_held(
+                    meta.get("entry_signal_bar_ts") or meta.get("entry_ts"),
+                    current_bar,
+                    self.freq,
+                )
+                reason = x18_exit_reason(
+                    entry_price=entry_px,
+                    sell_price=sell_px,
+                    fee_rate=fee,
+                    bars_held=bars_held,
+                    hard_stop_net_pct=float(x18_cfg.get("hard_stop_net_pct", 0.08)),
+                    soft_time_bars=int(x18_cfg.get("soft_time_bars", 216)),
+                    soft_time_min_net_pct=float(
+                        x18_cfg.get("soft_time_min_net_pct", 0.015)
+                    ),
+                )
+                if reason:
+                    exit_reasons[coin] = reason
+                    log.warning(
+                        "X18_EXIT_TRIGGER %s reason=%s entry=%.8f bid=%.8f "
+                        "bars_held=%s",
+                        coin, reason, entry_px, sell_px, bars_held,
+                    )
+
+        elif position_exits_enabled:
+            for coin, qty in held.items():
+                meta = entries.get(coin, {})
+                entry_px = float(meta.get("entry_price") or 0)
+                peak_px = float(meta.get("peak_price_since_entry") or 0)
+                pair = f"{coin}/USD"
+                sell_px = float(
+                    tick.get(pair, {}).get("MaxBid")
+                    or _px(coin)
+                    or 0
+                )
+                if entry_px <= 0 or peak_px <= 0 or sell_px <= 0:
+                    log.warning(
+                        "position exit rules skipped for %s: missing entry/peak/price metadata",
+                        coin,
+                    )
+                    continue
+                trend_failed = short_trend_failure(
+                    self.feed.d.get(coin),
+                    timeframe_minutes=self.freq,
+                    ema_span=int(exit_cfg.get("trend_ema_span", 10)),
+                )
+                reason = position_exit_reason(
+                    entry_price=entry_px,
+                    peak_price=peak_px,
+                    current_price=sell_px,
+                    fee_rate=fee,
+                    take_profit_net_pct=(
+                        float(exit_cfg["take_profit_net_pct"])
+                        if exit_cfg.get("take_profit_net_pct") is not None
+                        else None
+                    ),
+                    hard_loss_pct=float(exit_cfg.get("hard_loss_pct", 0.03)),
+                    trail_activation_net_pct=float(
+                        exit_cfg.get("trail_activation_net_pct", 0.05)
+                    ),
+                    giveback_fraction=float(exit_cfg.get("giveback_fraction", 0.50)),
+                    trend_failure=trend_failed,
+                )
+                if reason:
+                    exit_reasons[coin] = reason
+                    log.warning(
+                        "POSITION_EXIT_TRIGGER %s reason=%s entry=%.8f peak=%.8f bid=%.8f",
+                        coin, reason, entry_px, peak_px, sell_px,
+                    )
+
         log.info(
             "equity %.2f peak %.2f dd %.1f%% ladder_mult %.2f",
             eq,
@@ -496,16 +664,15 @@ class Bot:
         # Existing equity positions are completely ignored.
         # ---------------------------------------------------------
         for coin, qty in held.items():
-            if (
-                mode == "liquidate"
-                or (
-                    coin in tgt.index
-                    and tgt.get(coin, 0) <= 0
-                )
-            ):
+            triggered_reason = exit_reasons.get(coin)
+            if triggered_reason or should_exit_held(coin, tgt, mode):
                 pair = f"{coin}/USD"
+                if mode == "liquidate":
+                    sell_reason = "SELL_OTHER"
+                else:
+                    sell_reason = triggered_reason or "SELL_SIGNAL_EXIT"
 
-                self._order(
+                sold = self._order(
                     coin,
                     "SELL",
                     plan_exit(
@@ -513,7 +680,29 @@ class Bot:
                         self.pairs[pair]["AmountPrecision"],
                     ),
                     tick,
+                    reason=sell_reason,
                 )
+                if sold and (
+                    (x18_enabled and triggered_reason in {"hard_stop_X18", "soft_time_X18"})
+                    or (position_exits_enabled and not x18_enabled)
+                ):
+                    if x18_enabled:
+                        cooldown_bars = max(0, int(x18_cfg.get("cooldown_bars", 3)))
+                        current_bar = getattr(self, "current_signal_bar", None)
+                        if current_bar is not None:
+                            until_bar = pd.Timestamp(current_bar) + pd.Timedelta(
+                                minutes=self.freq * cooldown_bars
+                            )
+                            self.state.setdefault("x18_cooldown_until_bar", {})[coin] = until_bar.isoformat()
+                        else:
+                            log.warning("X18 cooldown not persisted for %s: signal bar timestamp missing", coin)
+                    else:
+                        cooldown_bars = max(0, int(exit_cfg.get("cooldown_bars", 2)))
+                        expires = pd.Timestamp.now(tz="UTC") + pd.Timedelta(
+                            minutes=self.freq * cooldown_bars
+                        )
+                        self.state.setdefault("exit_cooldowns", {})[coin] = expires.isoformat()
+                    self.save()
 
         if mode != "run":
             return
@@ -534,6 +723,50 @@ class Bot:
             ]
         )
 
+        cooldowns = self.state.setdefault("exit_cooldowns", {})
+        cooldown_now = pd.Timestamp.utcnow()
+
+        def _cooldown_active(coin):
+            if x18_enabled:
+                expiry_raw = self.state.setdefault("x18_cooldown_until_bar", {}).get(coin)
+                current_bar = getattr(self, "current_signal_bar", None)
+                if not expiry_raw or current_bar is None:
+                    return False
+                try:
+                    expiry = pd.Timestamp(expiry_raw)
+                    now_bar = pd.Timestamp(current_bar)
+                    if expiry.tzinfo is None:
+                        expiry = expiry.tz_localize("UTC")
+                    else:
+                        expiry = expiry.tz_convert("UTC")
+                    if now_bar.tzinfo is None:
+                        now_bar = now_bar.tz_localize("UTC")
+                    else:
+                        now_bar = now_bar.tz_convert("UTC")
+                    if now_bar < expiry:
+                        return True
+                except (TypeError, ValueError):
+                    log.warning("invalid X18 bar cooldown for %s; clearing it", coin)
+                self.state.setdefault("x18_cooldown_until_bar", {}).pop(coin, None)
+                return False
+            if not position_exits_enabled:
+                return False
+            expiry_raw = cooldowns.get(coin)
+            if not expiry_raw:
+                return False
+            try:
+                expiry = pd.Timestamp(expiry_raw)
+                if expiry.tzinfo is None:
+                    expiry = expiry.tz_localize("UTC")
+                else:
+                    expiry = expiry.tz_convert("UTC")
+                if expiry > cooldown_now:
+                    return True
+            except (TypeError, ValueError):
+                log.warning("invalid exit cooldown for %s; clearing it", coin)
+            cooldowns.pop(coin, None)
+            return False
+
         for coin in self._rank(
             [
                 c
@@ -542,6 +775,8 @@ class Bot:
                     v > 0
                     and c not in held
                     and c in crypto_coins
+                    and getattr(self, "entry_allowed", True)
+                    and not _cooldown_active(c)
                 )
             ]
         ):
@@ -570,6 +805,7 @@ class Bot:
                     "BUY",
                     q,
                     tick,
+                    reason="BUY_NEW_ENTRY",
                 )
             ):
                 n_open += 1
@@ -609,6 +845,7 @@ class Bot:
         side,
         qty,
         tick,
+        reason=None,
     ) -> bool:
         # Final safety guard: this bot may only trade crypto.
         pair_info = self.pairs.get(
@@ -630,6 +867,36 @@ class Bot:
 
         if qty <= 0:
             return False
+
+        meta = self.state.setdefault("entries", {}).get(coin, {})
+        last_price = float(
+            tick.get(pair, {}).get("LastPrice")
+            or tick.get(pair, {}).get("MaxBid")
+            or tick.get(pair, {}).get("MinAsk")
+            or 0
+        )
+        entry_price = meta.get("entry_price")
+        unrealized = (
+            (last_price - float(entry_price)) * float(qty)
+            if entry_price is not None and side == "SELL"
+            else None
+        )
+        reason = reason or ("BUY_NEW_ENTRY" if side == "BUY" else "SELL_OTHER")
+        log.info(
+            "ORDER_INTENT %s",
+            json.dumps({
+                "ts": pd.Timestamp.utcnow().isoformat(),
+                "symbol": pair, "side": side, "qty": qty, "reason": reason,
+                "entry_price": entry_price, "entry_ts": meta.get("entry_ts"),
+                "last_price": last_price or None, "unrealized_pnl": unrealized,
+                "peak_price_since_entry": meta.get("peak_price_since_entry"),
+                "mfe": meta.get("mfe"), "mae": meta.get("mae"),
+                "equity": self.order_context.get("equity"),
+                "peak_equity": self.order_context.get("peak_equity"),
+                "drawdown": self.order_context.get("drawdown"),
+                "dd_multiplier": self.order_context.get("dd_multiplier"),
+            }, sort_keys=True),
+        )
 
         if self.dry:
             log.info(
@@ -655,21 +922,48 @@ class Bot:
             )
             return False
 
-        notional = (
-            d.get("FilledQuantity", 0)
-            * d.get("FilledAverPrice", 0)
-        )
+        filled_qty = float(d.get("FilledQuantity") or 0)
+        fill_px = float(d.get("FilledAverPrice") or 0)
+        fee = float(d.get("CommissionChargeValue") or 0)
 
-        fee = d.get(
-            "CommissionChargeValue",
-            0,
-        )
+        if filled_qty <= 0 or fill_px <= 0:
+            log.error(
+                "order returned no valid fill for %s %s: filled_qty=%s fill_px=%s",
+                side, pair, filled_qty, fill_px,
+            )
+            return False
 
+        notional = filled_qty * fill_px
         self.state["pool_cash"]["crypto"] += (
             (notional - fee)
             if side == "SELL"
             else -(notional + fee)
         )
+
+        if side == "BUY":
+            self.state.setdefault("entries", {})[coin] = {
+                "entry_price": fill_px,
+                "entry_ts": pd.Timestamp.now(tz="UTC").isoformat(),
+                "entry_signal_bar_ts": (
+                    pd.Timestamp(getattr(self, "current_signal_bar")).isoformat()
+                    if getattr(self, "current_signal_bar", None) is not None
+                    else None
+                ),
+                "peak_price_since_entry": fill_px,
+                "trough_price_since_entry": fill_px,
+                "mfe": 0.0,
+                "mae": 0.0,
+            }
+        elif side == "SELL":
+            # Do not discard cost-basis / peak metadata on a partial fill.
+            # The next wallet snapshot remains the source of truth for residual qty.
+            if filled_qty + max(1e-12, float(qty) * 1e-8) >= float(qty):
+                self.state.setdefault("entries", {}).pop(coin, None)
+            else:
+                log.warning(
+                    "partial SELL fill for %s: requested=%s filled=%s; retaining position metadata",
+                    pair, qty, filled_qty,
+                )
 
         self.save()
 

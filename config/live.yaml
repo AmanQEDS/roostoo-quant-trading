@@ -10,4 +10,14 @@ strategies:
   equity: null
 mode: run
 dd_ladder: [[0.10, 0.5], [0.20, 0.25]]
+entry_filter:
+  f2_enabled: true
+  reference_symbol: BTC
+  window_days: 14
+x18:
+  enabled: true
+  hard_stop_net_pct: 0.08
+  soft_time_bars: 216
+  soft_time_min_net_pct: 0.015
+  cooldown_bars: 3
 start_utc: "2026-10-03 00:00"
