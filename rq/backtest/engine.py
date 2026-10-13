@@ -83,6 +83,7 @@ class BacktestResult:
     turnover_usd: float
     skipped: dict
     open_positions: list
+    lock_events: list = field(default_factory=list)
 
 
 def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.DataFrame | None = None,
@@ -132,6 +133,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     lock_armed = False
     portfolio_lock_pending = False
     portfolio_lock_cooldown_until = -1
+    lock_events: list[dict] = []
     fees_total = turnover = realized_total = 0.0
     skipped = {"cap_pos": 0, "min_order": 0, "corr": 0, "exposure": 0, "no_cash": 0}
     trades: list[dict] = []
@@ -139,6 +141,34 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     cash_curve = np.zeros(T); gross_exposure = np.zeros(T); net_exposure = np.zeros(T)
     realized_curve = np.zeros(T); unrealized_curve = np.zeros(T)
     idx = panel.index
+
+    def record_lock_event(event, i, net_liquidation_equity=None,
+                          estimated_exit_cost=None, peak_profit=None,
+                          lock_floor=None):
+        lock_events.append({
+            "event": event,
+            "bar_index": int(i),
+            "timestamp": idx[i],
+            "equity": float(tot),
+            "net_liquidation_equity": (
+                float(net_liquidation_equity)
+                if net_liquidation_equity is not None else np.nan
+            ),
+            "estimated_exit_cost": (
+                float(estimated_exit_cost)
+                if estimated_exit_cost is not None else np.nan
+            ),
+            "lock_cycle_base": float(lock_cycle_base),
+            "lock_cycle_peak": float(lock_cycle_peak),
+            "peak_profit": (
+                float(peak_profit) if peak_profit is not None else np.nan
+            ),
+            "lock_floor": float(lock_floor) if lock_floor is not None else np.nan,
+            "open_positions": int((side != 0).sum()),
+            "fee_rate": float(fee),
+            "min_slippage_bps": float(np.min(slip) * 1e4) if len(slip) else 0.0,
+            "max_slippage_bps": float(np.max(slip) * 1e4) if len(slip) else 0.0,
+        })
 
     def value(px):
         v = np.zeros(N)
@@ -221,11 +251,26 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 if net_liquidation_equity - lock_cycle_base >= exit_config.portfolio_lock_activation:
                     lock_armed = True
                     lock_cycle_peak = net_liquidation_equity
+                    record_lock_event(
+                        "activated", i, net_liquidation_equity,
+                        estimated_exit_cost,
+                        peak_profit=lock_cycle_peak - lock_cycle_base,
+                    )
             else:
                 lock_cycle_peak = max(lock_cycle_peak, net_liquidation_equity)
                 peak_profit = lock_cycle_peak - lock_cycle_base
                 lock_floor = lock_cycle_base + peak_profit * (1.0 - exit_config.portfolio_lock_giveback)
+                record_lock_event(
+                    "armed_observation", i, net_liquidation_equity,
+                    estimated_exit_cost, peak_profit=peak_profit,
+                    lock_floor=lock_floor,
+                )
                 if net_liquidation_equity <= lock_floor:
+                    record_lock_event(
+                        "triggered", i, net_liquidation_equity,
+                        estimated_exit_cost, peak_profit=peak_profit,
+                        lock_floor=lock_floor,
+                    )
                     lock_armed = False
                     portfolio_lock_pending = True
 
@@ -341,6 +386,13 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
         # position has actually liquidated. Use realized cash after actual fills,
         # not the trigger-bar estimate, as the next cycle's baseline.
         if portfolio_lock_pending and not (side != 0).any():
+            record_lock_event(
+                "liquidation_complete", i,
+                net_liquidation_equity=float(cash.sum()),
+                estimated_exit_cost=0.0, peak_profit=lock_cycle_peak - lock_cycle_base,
+                lock_floor=lock_cycle_base + (lock_cycle_peak - lock_cycle_base)
+                * (1.0 - exit_config.portfolio_lock_giveback),
+            )
             portfolio_lock_pending = False
             lock_cycle_base = float(cash.sum())
             lock_cycle_peak = lock_cycle_base
@@ -427,4 +479,4 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                       "peak_price_since_entry": peak_high[j], "trough_price_since_entry": trough_low[j],
                       "mfe": max(0.0, (peak_high[j] - entry[j]) * q[j]) if side[j] == 1 else np.nan,
                       "mae": min(0.0, (trough_low[j] - entry[j]) * q[j]) if side[j] == 1 else np.nan})
-    return BacktestResult(curve, tdf, fees_total, turnover, skipped, openp)
+    return BacktestResult(curve, tdf, fees_total, turnover, skipped, openp, lock_events)
