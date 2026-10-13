@@ -179,14 +179,14 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
         net_exposure[i] = (side * q * px).sum()
         realized_curve[i] = realized_total
         unrealized_curve[i] = unrealized_net(px)
-        if i == T - 1:
-            break
-        peak = max(peak, tot); dd = 1 - tot / peak
-
-        # Maintain per-position excursions from completed bars only.
+        # Maintain per-position excursions through the latest completed bar.
         active = side == 1
         peak_high[active] = np.maximum(peak_high[active], H[i, active])
         trough_low[active] = np.minimum(trough_low[active], L[i, active])
+
+        if i == T - 1:
+            break
+        peak = max(peak, tot); dd = 1 - tot / peak
 
         # --- risk exits decided on information at close i
         force = np.zeros(N, bool); reason = np.array([""] * N, dtype=object)
