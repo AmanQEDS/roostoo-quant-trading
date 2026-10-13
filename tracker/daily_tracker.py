@@ -159,7 +159,7 @@ def generate(lines, date):
             trade = open_trades.pop(fill["pair"], None)
             candidates = intent_by_key.get(key, [])
             intent = candidates.pop(0) if candidates else {}
-            entry_px = (trade or {}).get("entry_price")
+            entry_px = (trade or {}).get("entry_price") or intent.get("entry_price")
             final_pnl = (fill["price"] - entry_px) * min(fill["qty"], (trade or {}).get("qty", fill["qty"])) if entry_px else None
             mfe = intent.get("mfe") if intent.get("mfe") is not None else (trade or {}).get("mfe")
             mae = intent.get("mae") if intent.get("mae") is not None else (trade or {}).get("mae")
