@@ -28,6 +28,8 @@ DRY_RE = re.compile(
     r"\[dry-run\] (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<pair>[A-Z0-9]+/USD)"
 )
 
+ORDER_INTENT_RE = re.compile(r"ORDER_INTENT (?P<payload>\\{.*\\})")
+
 UNIVERSE_RE = re.compile(r"selected crypto: (?P<universe>\[.*\])")
 
 WARNING_RE = re.compile(r"\d+ WARNING ")
@@ -76,12 +78,20 @@ def generate(lines, date):
     fills = []
     dry_orders = []
     equities = []
+    order_intents = []
     signals = []
     warnings = 0
     errors = 0
     universe = None
 
     for line in rows:
+        m = ORDER_INTENT_RE.search(line)
+        if m:
+            try:
+                order_intents.append(__import__("json").loads(m.group("payload")))
+            except (ValueError, TypeError):
+                pass
+
         m = FILL_RE.search(line)
         if m:
             fills.append({
@@ -122,6 +132,46 @@ def generate(lines, date):
         m = UNIVERSE_RE.search(line)
         if m:
             universe = m.group("universe")
+
+    # Match order intents to fills by symbol/side in chronological order.
+    # MFE/MAE are quote-currency P&L estimates based on logged price extrema;
+    # legacy logs without ORDER_INTENT metadata remain explicitly unavailable.
+    intent_by_key = {}
+    for item in order_intents:
+        intent_by_key.setdefault((item.get("symbol"), item.get("side")), []).append(item)
+
+    open_trades = {}
+    excursions = []
+    for fill in fills:
+        key = (fill["pair"], fill["side"])
+        if fill["side"] == "BUY":
+            candidates = intent_by_key.get(key, [])
+            intent = candidates.pop(0) if candidates else {}
+            open_trades[fill["pair"]] = {
+                "entry_price": fill["price"],
+                "entry_ts": fill.get("ts"),
+                "qty": fill["qty"],
+                "mfe": float(intent.get("mfe", 0.0) or 0.0),
+                "mae": float(intent.get("mae", 0.0) or 0.0),
+                "peak_price": intent.get("peak_price_since_entry", fill["price"]),
+            }
+        elif fill["side"] == "SELL":
+            trade = open_trades.pop(fill["pair"], None)
+            candidates = intent_by_key.get(key, [])
+            intent = candidates.pop(0) if candidates else {}
+            entry_px = (trade or {}).get("entry_price")
+            final_pnl = (fill["price"] - entry_px) * min(fill["qty"], (trade or {}).get("qty", fill["qty"])) if entry_px else None
+            mfe = intent.get("mfe", (trade or {}).get("mfe"))
+            mae = intent.get("mae", (trade or {}).get("mae"))
+            if entry_px and trade:
+                mfe = max(float(mfe or 0.0), (float(intent.get("peak_price_since_entry") or (trade.get("peak_price") or entry_px)) - entry_px) * min(fill["qty"], trade["qty"]))
+                mae = float(mae or 0.0)
+            excursions.append({
+                "pair": fill["pair"], "final_pnl": final_pnl,
+                "mfe": float(mfe) if mfe is not None else None,
+                "mae": float(mae) if mae is not None else None,
+                "giveback": float(mfe) - final_pnl if mfe is not None and final_pnl is not None else None,
+            })
 
     total_fees = sum(x["fee"] for x in fills)
     buys = sum(x["side"] == "BUY" for x in fills)
@@ -184,6 +234,21 @@ def generate(lines, date):
     else:
         lines_out.append("No filled orders recorded.")
 
+    lines_out += [
+        "",
+        "## Trade Excursions (when entry/exit metadata is available)",
+        "",
+    ]
+    if excursions:
+        lines_out += [
+            "| Pair | MFE | MAE | Estimated final P&L (before fees) | Giveback (MFE − final) |",
+            "|---|---:|---:|---:|---:|",
+        ]
+        for x in excursions:
+            fmt = lambda v: f"{v:,.2f}" if v is not None else "N/A"
+            lines_out.append(f"| {x['pair']} | {fmt(x['mfe'])} | {fmt(x['mae'])} | {fmt(x['final_pnl'])} | {fmt(x['giveback'])} |")
+    else:
+        lines_out.append("MFE/MAE/giveback unavailable: no reconstructable trade excursions in this log format.")
     lines_out += [
         "",
         "## Universe",
