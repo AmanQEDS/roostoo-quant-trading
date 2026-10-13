@@ -816,16 +816,18 @@ class Bot:
             )
             return False
 
-        notional = (
-            d.get("FilledQuantity", 0)
-            * d.get("FilledAverPrice", 0)
-        )
+        filled_qty = float(d.get("FilledQuantity") or 0)
+        fill_px = float(d.get("FilledAverPrice") or 0)
+        fee = float(d.get("CommissionChargeValue") or 0)
 
-        fee = d.get(
-            "CommissionChargeValue",
-            0,
-        )
+        if filled_qty <= 0 or fill_px <= 0:
+            log.error(
+                "order returned no valid fill for %s %s: filled_qty=%s fill_px=%s",
+                side, pair, filled_qty, fill_px,
+            )
+            return False
 
+        notional = filled_qty * fill_px
         self.state["pool_cash"]["crypto"] += (
             (notional - fee)
             if side == "SELL"
@@ -833,7 +835,6 @@ class Bot:
         )
 
         if side == "BUY":
-            fill_px = float(d.get("FilledAverPrice") or last_price or 0)
             self.state.setdefault("entries", {})[coin] = {
                 "entry_price": fill_px,
                 "entry_ts": pd.Timestamp.utcnow().isoformat(),
@@ -843,7 +844,15 @@ class Bot:
                 "mae": 0.0,
             }
         elif side == "SELL":
-            self.state.setdefault("entries", {}).pop(coin, None)
+            # Do not discard cost-basis / peak metadata on a partial fill.
+            # The next wallet snapshot remains the source of truth for residual qty.
+            if filled_qty + max(1e-12, float(qty) * 1e-8) >= float(qty):
+                self.state.setdefault("entries", {}).pop(coin, None)
+            else:
+                log.warning(
+                    "partial SELL fill for %s: requested=%s filled=%s; retaining position metadata",
+                    pair, qty, filled_qty,
+                )
 
         self.save()
 
