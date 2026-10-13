@@ -8,7 +8,7 @@ from ..constants import TRAIN_START, TRAIN_END, VAL_START
 from ..signals.families import BUILDERS
 from ..signals.elliott import elliott
 from ..signals.core import to_target, MissingData, Cond
-from ..backtest.engine import run_backtest, PortfolioConfig
+from ..backtest.engine import run_backtest, PortfolioConfig, ExitConfig
 from ..backtest.metrics import perf_report, rolling_window_report
 from .grid import Spec, RULES
 
@@ -34,14 +34,23 @@ def build_targets(panel, spec: Spec, ext: dict, allow_short: bool, classes_overr
     return t, s
 
 
-def evaluate(panel_full, spec: Spec, ext: dict, pcfg: PortfolioConfig, start, end, tf: str):
+def evaluate(panel_full, spec: Spec, ext: dict, pcfg: PortfolioConfig, start, end, tf: str,
+             exit_config: ExitConfig | None = None):
     """Signals on history <= end (causal), engine on [start, end]."""
     p_end = panel_full.slice(None, end)
     t, s = build_targets(p_end, spec, ext, pcfg.allow_short)
     pw = p_end.slice(start, end)
-    res = run_backtest(pw, t.loc[pw.index], pcfg, s.loc[pw.index])
+    res = run_backtest(pw, t.loc[pw.index], pcfg, s.loc[pw.index], exit_config=exit_config)
     rep = perf_report(res, panel_full.freq_min, pcfg.capital)
     rep.update(rolling_window_report(res.curve["equity_total"], 14))
+    if not res.trades.empty:
+        for source, target in (("mfe", "avg_mfe"), ("mae", "avg_mae"), ("giveback", "avg_giveback")):
+            if source in res.trades:
+                rep[target] = float(res.trades[source].mean())
+        if "profitable_1atr_loser" in res.trades:
+            rep["pct_1atr_profit_then_loser"] = float(res.trades["profitable_1atr_loser"].mean() * 100)
+    else:
+        rep.update(avg_mfe=0.0, avg_mae=0.0, avg_giveback=0.0, pct_1atr_profit_then_loser=0.0)
     return res, rep
 
 
