@@ -212,7 +212,6 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
         peak = max(peak, tot); dd = 1 - tot / peak
 
         # --- optional portfolio-level profit lock (research-only unless explicitly enabled)
-        portfolio_lock_trigger = False
         if exit_config and exit_config.portfolio_lock_enabled and not portfolio_lock_pending:
             # Estimate liquidation equity net of closing fee and slippage; the
             # actual fill can still differ when the next execution price gaps.
@@ -227,7 +226,6 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 peak_profit = lock_cycle_peak - lock_cycle_base
                 lock_floor = lock_cycle_base + peak_profit * (1.0 - exit_config.portfolio_lock_giveback)
                 if net_liquidation_equity <= lock_floor:
-                    portfolio_lock_trigger = True
                     lock_armed = False
                     portfolio_lock_pending = True
 
