@@ -131,6 +131,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     lock_cycle_peak = pcfg.capital
     lock_armed = False
     portfolio_lock_pending = False
+    portfolio_lock_cooldown_until = -1
     fees_total = turnover = realized_total = 0.0
     skipped = {"cap_pos": 0, "min_order": 0, "corr": 0, "exposure": 0, "no_cash": 0}
     trades: list[dict] = []
@@ -211,8 +212,6 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
         peak = max(peak, tot); dd = 1 - tot / peak
 
         # --- optional portfolio-level profit lock (research-only unless explicitly enabled)
-        if portfolio_lock_pending and not (side != 0).any():
-            portfolio_lock_pending = False
         portfolio_lock_trigger = False
         if exit_config and exit_config.portfolio_lock_enabled and not portfolio_lock_pending:
             # Estimate liquidation equity net of closing fee and slippage; the
@@ -230,17 +229,10 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 if net_liquidation_equity <= lock_floor:
                     portfolio_lock_trigger = True
                     lock_armed = False
-                    lock_cycle_base = net_liquidation_equity
-                    lock_cycle_peak = net_liquidation_equity
                     portfolio_lock_pending = True
 
         # --- risk exits decided on information at close i
         force = np.zeros(N, bool); reason = np.array([""] * N, dtype=object)
-        if portfolio_lock_trigger:
-            active = side != 0
-            force |= active
-            reason[active] = "portfolio_profit_lock"
-            halt_until = max(halt_until, i + exit_config.portfolio_lock_cooldown_bars)
         if (rc.stop_loss or rc.take_profit) and (side != 0).any():
             pnl = np.where(side != 0, side * (px / np.where(entry > 0, entry, np.nan) - 1), 0.0)
             if rc.stop_loss:
@@ -314,7 +306,15 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                     blocked[j] = side[j]
                     cooldown_until[j] = i + exit_config.cooldown_bars
 
-        halted = (i < halt_until) or portfolio_lock_pending
+        # The lock takes priority while liquidation is pending so retries retain
+        # the correct reason and every still-open position remains forced flat.
+        if portfolio_lock_pending:
+            active = side != 0
+            force |= active
+            reason[active] = "portfolio_profit_lock"
+            blocked[active] = side[active]
+
+        halted = (i < halt_until) or (i <= portfolio_lock_cooldown_until) or portfolio_lock_pending
         if rc.dd_halt and dd >= rc.dd_halt and not halted:
             halt_until = i + rc.halt_bars                # pause new entries for halt_bars
             force |= side != 0; reason[side != 0] = "halt"
@@ -338,6 +338,20 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
         for j in np.flatnonzero(need & (side != 0)):
             price = ex[j] * (1 - slip[j]) if side[j] == 1 else ex[j] * (1 + slip[j])
             close_pos(j, i, price, reason[j] or "signal")
+
+        # Start the cooldown and the next profit-lock cycle only after every
+        # position has actually liquidated. Use realized cash after actual fills,
+        # not the trigger-bar estimate, as the next cycle's baseline.
+        if portfolio_lock_pending and not (side != 0).any():
+            portfolio_lock_pending = False
+            lock_cycle_base = float(cash.sum())
+            lock_cycle_peak = lock_cycle_base
+            lock_armed = False
+            portfolio_lock_cooldown_until = max(
+                portfolio_lock_cooldown_until,
+                i + exit_config.portfolio_lock_cooldown_bars,
+            )
+
         # ---- entries, highest score first, sequential on remaining pool cash
         cand = np.flatnonzero(need & (desired != 0) & (side == 0))
         if len(cand) and not halted:
