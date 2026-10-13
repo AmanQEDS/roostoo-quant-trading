@@ -106,7 +106,7 @@ def test_drawdown_ladder_does_not_force_sell_existing_positions():
             risk=RiskConfig(dd_ladder=((0.10, 0.5),))),
     )
     # The existing A position remains open despite the portfolio drawdown.
-    assert not ((r.trades.asset == "A") & (r.trades.reason == "signal")).any()
+    assert not any(t["asset"] == "A" and t["reason"] == "signal" for t in r.trades.to_dict("records"))
     assert any(pos["asset"] == "A" for pos in r.open_positions)
     # B is a new entry after the drawdown and must be sized below A's initial notional.
     b = next(pos for pos in r.open_positions if pos["asset"] == "B")
