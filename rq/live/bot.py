@@ -685,6 +685,7 @@ class Bot:
                 "entry_price": entry_price, "entry_ts": meta.get("entry_ts"),
                 "last_price": last_price or None, "unrealized_pnl": unrealized,
                 "peak_price_since_entry": meta.get("peak_price_since_entry"),
+                "mfe": meta.get("mfe"), "mae": meta.get("mae"),
                 "equity": self.order_context.get("equity"),
                 "peak_equity": self.order_context.get("peak_equity"),
                 "drawdown": self.order_context.get("drawdown"),
