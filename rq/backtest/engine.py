@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 from ..constants import TAKER_FEE, INITIAL_CAPITAL
 from .risk import RiskConfig, vol_scale_matrix
+from .. import indicators as I
 
 CLS = {"crypto": 0, "equity": 1}
 
@@ -38,6 +39,31 @@ class PortfolioConfig:
                 f"_{'LS' if self.allow_short else 'L'}_fee{self.fee*1e4:.0f}bp")
 
 
+@dataclass(frozen=True)
+class ExitConfig:
+    """Research-only, stateful long-position exit rules; default X0 preserves the signal exit."""
+    variant: str = "X0"
+    atr_n: int = 14
+    chandelier_k: float = 3.0
+    breakeven_atr: float = 1.5
+    trailing_pct: float = 0.05
+    giveback_trigger_atr: float = 1.0
+    giveback_fraction: float = 0.5
+    donchian_n: int = 24
+    partial_r: float = 1.5
+    cooldown_bars: int = 6
+
+    def __post_init__(self):
+        if self.variant not in {f"X{i}" for i in range(8)}:
+            raise ValueError(f"unknown exit variant: {self.variant}")
+        if self.atr_n < 1 or self.cooldown_bars < 0:
+            raise ValueError("atr_n must be positive and cooldown_bars nonnegative")
+        if self.chandelier_k <= 0 or not 0 < self.trailing_pct < 1:
+            raise ValueError("invalid trailing-stop parameters")
+        if not 0 < self.giveback_fraction < 1 or self.giveback_trigger_atr <= 0:
+            raise ValueError("invalid giveback parameters")
+
+
 @dataclass
 class BacktestResult:
     curve: pd.DataFrame            # portfolio value, pools, exposure, cash, and P&L attribution
@@ -48,12 +74,20 @@ class BacktestResult:
     open_positions: list
 
 
-def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.DataFrame | None = None) -> BacktestResult:
+def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.DataFrame | None = None,
+                 exit_config: ExitConfig | None = None) -> BacktestResult:
     cols = list(panel.close.columns)
     N, T = len(cols), len(panel.index)
     cls = np.array([CLS[panel.classes[c]] for c in cols])
     C = panel.close.values.astype(float)
+    H = panel.high.values.astype(float)
+    L = panel.low.values.astype(float)
     X = panel.exec_px.values.astype(float)
+    atr_values = I.atr(panel.high, panel.low, panel.close, exit_config.atr_n if exit_config else 14).values
+    donchian_lows = {}
+    if exit_config and exit_config.variant == "X5":
+        for n in {exit_config.donchian_n}:
+            donchian_lows[n] = I.donchian(panel.high, panel.low, n)[1].values
     TR = panel.tradable.values.astype(bool)
     TG = target.reindex(index=panel.index, columns=cols).fillna(0).values.astype(np.int8)
     SC = score.reindex(index=panel.index, columns=cols).values if score is not None else None
@@ -71,6 +105,8 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     cash = pcfg.capital * w
     q = np.zeros(N); entry = np.zeros(N); collat = np.zeros(N); side = np.zeros(N, dtype=np.int8)
     blocked = np.zeros(N, dtype=np.int8); e_fee = np.zeros(N); e_bar = np.zeros(N, dtype=int)
+    peak_high = np.zeros(N); trough_low = np.zeros(N); entry_atr = np.zeros(N)
+    partial_taken = np.zeros(N, dtype=bool); cooldown_until = np.full(N, -1, dtype=int)
     trade_ids = np.zeros(N, dtype=np.int64)
     next_trade_id = 1
     halt_until = -1
@@ -111,6 +147,8 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
         realized_total += net_pnl
         fees_total += f; turnover += notional
         entry_notional = entry[j] * q[j]
+        mfe = max(0.0, (peak_high[j] - entry[j]) * q[j]) if side[j] == 1 else 0.0
+        mae = min(0.0, (trough_low[j] - entry[j]) * q[j]) if side[j] == 1 else 0.0
         trades.append({"trade_id": int(trade_ids[j]), "asset": cols[j], "class": panel.classes[cols[j]],
                        "side": int(side[j]), "entry_time": idx[e_bar[j]], "exit_time": idx[exit_i],
                        "entry_px": entry[j], "exit_px": price, "qty": q[j], "entry_fee": e_fee[j],
@@ -119,8 +157,15 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                        "holding_period_hours": (idx[exit_i] - idx[e_bar[j]]).total_seconds() / 3600,
                        "entry_fill_id": f"{int(trade_ids[j])}:entry", "exit_fill_id": f"{int(trade_ids[j])}:exit",
                        "entry_fill_qty": q[j], "entry_fill_px": entry[j], "exit_fill_qty": q[j], "exit_fill_px": price,
-                       "bars": i + 1 - e_bar[j], "reason": reason})
-        q[j] = entry[j] = collat[j] = e_fee[j] = 0.0; side[j] = 0; trade_ids[j] = 0
+                       "bars": i + 1 - e_bar[j], "reason": reason,
+                       "mfe": mfe, "mae": mae, "giveback": mfe - net_pnl,
+                       "entry_atr": entry_atr[j],
+                       "mfe_atr": mfe / (q[j] * entry_atr[j]) if q[j] > 0 and entry_atr[j] > 0 else np.nan,
+                       "profitable_1atr_loser": bool(entry_atr[j] > 0 and mfe >= q[j] * entry_atr[j] and net_pnl < 0)})
+        q[j] = entry[j] = collat[j] = e_fee[j] = 0.0
+        peak_high[j] = trough_low[j] = entry_atr[j] = 0.0
+        partial_taken[j] = False
+        side[j] = 0; trade_ids[j] = 0
 
     for i in range(T):
         px = np.nan_to_num(C[i])
@@ -138,6 +183,11 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
             break
         peak = max(peak, tot); dd = 1 - tot / peak
 
+        # Maintain per-position excursions from completed bars only.
+        active = side == 1
+        peak_high[active] = np.maximum(peak_high[active], H[i, active])
+        trough_low[active] = np.minimum(trough_low[active], L[i, active])
+
         # --- risk exits decided on information at close i
         force = np.zeros(N, bool); reason = np.array([""] * N, dtype=object)
         if (rc.stop_loss or rc.take_profit) and (side != 0).any():
@@ -146,6 +196,69 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 m = (side != 0) & (pnl <= -rc.stop_loss); force |= m; reason[m] = "stop"; blocked[m] = side[m]
             if rc.take_profit:
                 m = (side != 0) & (pnl >= rc.take_profit); force |= m; reason[m] = "tp"; blocked[m] = side[m]
+        # Optional research-only stateful exits. Signals remain the original X0 targets.
+        if exit_config and exit_config.variant != "X0":
+            v = exit_config.variant
+            for j in np.flatnonzero(side == 1):
+                a = atr_values[i, j]
+                a = float(a) if np.isfinite(a) and a > 0 else entry_atr[j]
+                stop = -np.inf
+                if v in {"X1", "X6", "X7"} and a > 0:
+                    stop = max(stop, peak_high[j] - exit_config.chandelier_k * a)
+                if v in {"X2", "X7"} and entry_atr[j] > 0:
+                    if peak_high[j] - entry[j] >= exit_config.breakeven_atr * entry_atr[j]:
+                        stop = max(stop, entry[j] * (1 + 2 * fee))
+                if v == "X3" and peak_high[j] > 0:
+                    stop = max(stop, peak_high[j] * (1 - exit_config.trailing_pct))
+                if v == "X4" and entry_atr[j] > 0:
+                    peak_gain = peak_high[j] - entry[j]
+                    if peak_gain >= exit_config.giveback_trigger_atr * entry_atr[j]:
+                        if C[i, j] - entry[j] <= (1 - exit_config.giveback_fraction) * peak_gain:
+                            force[j] = True; reason[j] = "giveback_X4"
+                if v == "X5":
+                    lo = donchian_lows[exit_config.donchian_n][i, j]
+                    if np.isfinite(lo) and C[i, j] < lo:
+                        force[j] = True; reason[j] = "donchian_low_X5"
+                if v == "X6" and not partial_taken[j] and entry_atr[j] > 0:
+                    target_px = entry[j] + exit_config.partial_r * entry_atr[j]
+                    if H[i, j] >= target_px and q[j] > 1e-12:
+                        partial_qty = np.floor((q[j] / 2) * 10 ** amt_prec[j]) / 10 ** amt_prec[j]
+                        if 0 < partial_qty < q[j]:
+                            price = X[i, j] * (1 - slip[j])
+                            part_fee = fee * partial_qty * price
+                            part_entry_fee = e_fee[j] * (partial_qty / q[j])
+                            part_pnl_gross = partial_qty * (price - entry[j])
+                            cash[cls[j]] += partial_qty * price - part_fee
+                            fees_total += part_fee; turnover += partial_qty * price
+                            trades.append({
+                                "trade_id": int(trade_ids[j]), "asset": cols[j], "class": panel.classes[cols[j]],
+                                "side": 1, "entry_time": idx[e_bar[j]], "exit_time": idx[min(i + 1, T - 1)],
+                                "entry_px": entry[j], "exit_px": price, "qty": partial_qty,
+                                "entry_fee": part_entry_fee, "exit_fee": part_fee, "gross_pnl": part_pnl_gross,
+                                "pnl_net": part_pnl_gross - part_fee - part_entry_fee,
+                                "fees": part_fee + part_entry_fee, "return_pct": (part_pnl_gross - part_fee - part_entry_fee) / (entry[j] * partial_qty) * 100,
+                                "holding_period_hours": (idx[min(i + 1, T - 1)] - idx[e_bar[j]]).total_seconds() / 3600,
+                                "entry_fill_id": f"{int(trade_ids[j])}:entry-part", "exit_fill_id": f"{int(trade_ids[j])}:partial",
+                                "entry_fill_qty": partial_qty, "entry_fill_px": entry[j], "exit_fill_qty": partial_qty, "exit_fill_px": price,
+                                "bars": i + 1 - e_bar[j], "reason": "partial_tp_X6",
+                                "mfe": max(0.0, (peak_high[j] - entry[j]) * partial_qty),
+                                "mae": min(0.0, (trough_low[j] - entry[j]) * partial_qty),
+                                "giveback": max(0.0, (peak_high[j] - entry[j]) * partial_qty) - (part_pnl_gross - part_fee - part_entry_fee),
+                                "entry_atr": entry_atr[j],
+                                "mfe_atr": max(0.0, (peak_high[j] - entry[j]) * partial_qty) / (partial_qty * entry_atr[j]),
+                                "profitable_1atr_loser": bool((peak_high[j] - entry[j]) >= entry_atr[j] and (part_pnl_gross - part_fee - part_entry_fee) < 0),
+                            })
+                            old_qty = q[j]
+                            q[j] -= partial_qty
+                            e_fee[j] -= part_entry_fee
+                            # Give the remaining tranche its own unique trade id for audit integrity.
+                            trade_ids[j] = next_trade_id; next_trade_id += 1
+                            partial_taken[j] = True
+                if np.isfinite(stop) and C[i, j] <= stop:
+                    force[j] = True; reason[j] = f"protective_{v}"
+                    blocked[j] = side[j]
+                    cooldown_until[j] = i + exit_config.cooldown_bars
+
         halted = i < halt_until
         if rc.dd_halt and dd >= rc.dd_halt and not halted:
             halt_until = i + rc.halt_bars                # pause new entries for halt_bars
@@ -181,6 +294,8 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                     dd_mult = m
             val_now = value(px); invested = np.bincount(cls, weights=val_now, minlength=2)
             for j in cand:
+                if exit_config and i < cooldown_until[j]:
+                    continue
                 c = cls[j]
                 if dd_mult <= 0:
                     break
@@ -211,6 +326,9 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 nt = qty * price; f = fee * nt
                 cash[c] -= nt + f        # long: pay notional+fee; short: lock collateral(=nt) + open fee
                 q[j], entry[j], side[j], e_fee[j], e_bar[j] = qty, price, d, f, i + 1
+                peak_high[j] = trough_low[j] = price
+                entry_atr[j] = float(atr_values[i, j]) if np.isfinite(atr_values[i, j]) and atr_values[i, j] > 0 else price * 0.02
+                partial_taken[j] = False
                 trade_ids[j] = next_trade_id
                 next_trade_id += 1
                 collat[j] = nt if d == -1 else 0.0
@@ -236,5 +354,8 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                       "entry_time": idx[e_bar[j]], "entry": entry[j], "qty": q[j],
                       "current_price": current_px, "entry_fee": e_fee[j], "gross_unrealized_pnl": gross_pnl,
                       "unrealized_pnl": unrealized_pnl,
-                      "unrealized_return_pct": unrealized_pnl / entry_notional * 100 if entry_notional else np.nan})
+                      "unrealized_return_pct": unrealized_pnl / entry_notional * 100 if entry_notional else np.nan,
+                      "peak_price_since_entry": peak_high[j], "trough_price_since_entry": trough_low[j],
+                      "mfe": max(0.0, (peak_high[j] - entry[j]) * q[j]) if side[j] == 1 else np.nan,
+                      "mae": min(0.0, (trough_low[j] - entry[j]) * q[j]) if side[j] == 1 else np.nan})
     return BacktestResult(curve, tdf, fees_total, turnover, skipped, openp)
