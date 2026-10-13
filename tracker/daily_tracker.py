@@ -28,7 +28,7 @@ DRY_RE = re.compile(
     r"\[dry-run\] (?P<side>BUY|SELL) (?P<qty>[\d.]+) (?P<pair>[A-Z0-9]+/USD)"
 )
 
-ORDER_INTENT_RE = re.compile(r"ORDER_INTENT (?P<payload>\\{.*\\})")
+ORDER_INTENT_RE = re.compile(r"ORDER_INTENT (?P<payload>\{.*\})")
 
 UNIVERSE_RE = re.compile(r"selected crypto: (?P<universe>\[.*\])")
 
