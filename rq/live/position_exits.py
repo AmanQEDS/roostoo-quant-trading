@@ -28,16 +28,13 @@ def position_exit_reason(
     trail_activation_net_pct: float = 0.05,
     giveback_fraction: float = 0.50,
     trend_failure: bool = False,
+    take_profit_net_pct: float | None = None,
 ) -> str | None:
-    """Return an explicit exit reason or None.
-
-    The trailing rule activates after net estimated profit reaches 5% by
-    default. A 50% giveback means the position exits when current net profit
-    falls to 50% of the peak net profit. The hard stop is a net-return limit.
-    """
+    """Return an exit reason based on estimated net return after fees."""
     entry = float(entry_price)
     peak = float(peak_price)
     current = float(current_price)
+
     if entry <= 0 or peak <= 0 or current <= 0:
         return None
     if hard_loss_pct < 0:
@@ -46,22 +43,23 @@ def position_exit_reason(
         raise ValueError("trail_activation_net_pct must be non-negative")
     if not 0 <= giveback_fraction <= 1:
         raise ValueError("giveback_fraction must be between 0 and 1")
+    if take_profit_net_pct is not None and take_profit_net_pct < 0:
+        raise ValueError("take_profit_net_pct must be non-negative")
 
     current_net = estimated_net_return(entry, current, fee_rate)
     peak_net = estimated_net_return(entry, peak, fee_rate)
 
     if current_net <= -float(hard_loss_pct):
         return "SELL_HARD_STOP"
-
+    if take_profit_net_pct is not None and current_net >= float(take_profit_net_pct):
+        return "SELL_TAKE_PROFIT"
     if (
         peak_net >= float(trail_activation_net_pct)
         and current_net <= peak_net * (1.0 - float(giveback_fraction))
     ):
         return "SELL_PROFIT_TRAIL"
-
     if trend_failure:
         return "SELL_TREND_FAILURE"
-
     return None
 
 

@@ -211,3 +211,179 @@ def test_portfolio_profit_lock_retries_untradable_exit_and_starts_cooldown_after
     assert r.curve.n_pos.iloc[11] == 1
     assert len(r.open_positions) == 1
 
+
+
+def test_x8_exits_when_price_closes_below_a_falling_ema():
+    p = mini_panel({"A": [100, 100, 110, 108, 105, 100, 100]})
+    target = tgt(p, {"A": [1, 1, 1, 1, 1, 1, 0]})
+    r = run_backtest(
+        p,
+        target,
+        cfg(pos_frac=0.5),
+        exit_config=ExitConfig(variant="X8", trend_ema_span=2),
+    )
+    exited = r.trades[r.trades.reason == "ema_trend_failure_X8"]
+    assert len(exited) == 1
+    assert exited.iloc[0].exit_px == pytest.approx(105.0)
+
+
+def test_x9_exits_after_configured_holding_period():
+    p = mini_panel({"A": [100] * 9})
+    target = tgt(p, {"A": [1] * 9})
+    r = run_backtest(
+        p, target, cfg(pos_frac=0.5),
+        exit_config=ExitConfig(variant="X9", max_holding_bars=2),
+    )
+    exited = r.trades[r.trades.reason == "time_exit_X9"]
+    assert len(exited) == 1
+    assert exited.iloc[0].bars >= 2
+
+
+def test_x10_exits_stale_loser_but_keeps_profitable_position():
+    losing_panel = mini_panel({"A": [100, 100, 95, 95, 95, 95]})
+    losing_target = tgt(losing_panel, {"A": [1, 1, 1, 1, 1, 1]})
+    losing_result = run_backtest(
+        losing_panel,
+        losing_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X10", max_holding_bars=2),
+    )
+    assert (losing_result.trades.reason == "stale_loss_exit_X10").any()
+
+    winning_panel = mini_panel({"A": [100, 100, 105, 110, 115, 120]})
+    winning_target = tgt(winning_panel, {"A": [1, 1, 1, 1, 1, 1]})
+    winning_result = run_backtest(
+        winning_panel,
+        winning_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X10", max_holding_bars=2),
+    )
+    if not winning_result.trades.empty and "reason" in winning_result.trades.columns:
+        assert not (winning_result.trades["reason"] == "stale_loss_exit_X10").any()
+    assert len(winning_result.open_positions) == 1
+
+
+def test_x11_exits_stale_loser_only_when_trend_weakens():
+    losing_panel = mini_panel({"A": [100, 100, 95, 94, 93, 92, 91]})
+    losing_target = tgt(losing_panel, {"A": [1, 1, 1, 1, 1, 1, 1]})
+    losing_result = run_backtest(
+        losing_panel,
+        losing_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(
+            variant="X11",
+            max_holding_bars=2,
+            trend_ema_span=2,
+        ),
+    )
+    assert (
+        not losing_result.trades.empty
+        and "reason" in losing_result.trades.columns
+        and (losing_result.trades["reason"] == "stale_loss_trend_exit_X11").any()
+    )
+
+    winning_panel = mini_panel({"A": [100, 100, 105, 110, 115, 120, 125]})
+    winning_target = tgt(winning_panel, {"A": [1, 1, 1, 1, 1, 1, 1]})
+    winning_result = run_backtest(
+        winning_panel,
+        winning_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(
+            variant="X11",
+            max_holding_bars=2,
+            trend_ema_span=2,
+        ),
+    )
+    if not winning_result.trades.empty and "reason" in winning_result.trades.columns:
+        assert not (
+            winning_result.trades["reason"] == "stale_loss_trend_exit_X11"
+        ).any()
+    assert len(winning_result.open_positions) == 1
+
+
+def test_x12_ema20_exit_closes_below_ema_and_keeps_uptrend():
+    falling_panel = mini_panel({"A": [100, 100, 95, 94, 93, 92, 91]})
+    falling_target = tgt(falling_panel, {"A": [1] * 7})
+    falling_result = run_backtest(
+        falling_panel,
+        falling_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X12", ema_exit_span=2),
+    )
+    assert (
+        not falling_result.trades.empty
+        and "reason" in falling_result.trades.columns
+        and (falling_result.trades["reason"] == "ema20_exit_X12").any()
+    )
+
+    rising_panel = mini_panel({"A": [100, 100, 105, 110, 115, 120, 125]})
+    rising_target = tgt(rising_panel, {"A": [1] * 7})
+    rising_result = run_backtest(
+        rising_panel,
+        rising_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X12", ema_exit_span=2),
+    )
+    if not rising_result.trades.empty and "reason" in rising_result.trades.columns:
+        assert not (rising_result.trades["reason"] == "ema20_exit_X12").any()
+    assert len(rising_result.open_positions) == 1
+
+
+def test_x13_exits_on_negative_momentum_cross():
+    falling_panel = mini_panel({"A": [100, 100, 105, 106, 104, 102, 100, 98]})
+    falling_target = tgt(falling_panel, {"A": [1] * 8})
+    falling_result = run_backtest(
+        falling_panel,
+        falling_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X13", momentum_lookback=2),
+    )
+    assert (
+        not falling_result.trades.empty
+        and "reason" in falling_result.trades.columns
+        and (falling_result.trades["reason"] == "momentum_reversal_X13").any()
+    )
+
+    rising_panel = mini_panel({"A": [100, 100, 102, 104, 106, 108, 110, 112]})
+    rising_target = tgt(rising_panel, {"A": [1] * 8})
+    rising_result = run_backtest(
+        rising_panel,
+        rising_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X13", momentum_lookback=2),
+    )
+    if not rising_result.trades.empty and "reason" in rising_result.trades.columns:
+        assert not (
+            rising_result.trades["reason"] == "momentum_reversal_X13"
+        ).any()
+    assert len(rising_result.open_positions) == 1
+
+
+def test_x14_exits_when_ema_and_momentum_are_bearish():
+    falling_panel = mini_panel({"A": [100, 100, 105, 106, 104, 102, 100, 98]})
+    falling_target = tgt(falling_panel, {"A": [1] * 8})
+    falling_result = run_backtest(
+        falling_panel,
+        falling_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X14", momentum_lookback=2),
+    )
+    assert (
+        not falling_result.trades.empty
+        and "reason" in falling_result.trades.columns
+        and (falling_result.trades["reason"] == "ema_momentum_exit_X14").any()
+    )
+
+    rising_panel = mini_panel({"A": [100, 100, 102, 104, 106, 108, 110, 112]})
+    rising_target = tgt(rising_panel, {"A": [1] * 8})
+    rising_result = run_backtest(
+        rising_panel,
+        rising_target,
+        cfg(pos_frac=0.5, fee=0.001),
+        exit_config=ExitConfig(variant="X14", momentum_lookback=2),
+    )
+    if not rising_result.trades.empty and "reason" in rising_result.trades.columns:
+        assert not (
+            rising_result.trades["reason"] == "ema_momentum_exit_X14"
+        ).any()
+    assert len(rising_result.open_positions) == 1

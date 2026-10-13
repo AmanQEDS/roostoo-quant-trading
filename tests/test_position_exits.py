@@ -74,3 +74,28 @@ def test_short_trend_failure_ignores_incomplete_or_insufficient_data():
         frame, timeframe_minutes=30, ema_span=3,
         now=pd.Timestamp("2026-01-01 00:30", tz="UTC"),
     )
+
+
+
+def test_fixed_take_profit_uses_net_return_after_fees():
+    reason = position_exit_reason(
+        entry_price=100, peak_price=112, current_price=110,
+        fee_rate=0.001, take_profit_net_pct=0.08,
+    )
+    assert reason == "SELL_TAKE_PROFIT"
+
+
+def test_fixed_take_profit_does_not_fire_below_target():
+    reason = position_exit_reason(
+        entry_price=100, peak_price=106, current_price=105,
+        fee_rate=0.001, take_profit_net_pct=0.08,
+    )
+    assert reason is None
+
+
+def test_fixed_take_profit_is_disabled_by_default():
+    reason = position_exit_reason(
+        entry_price=100, peak_price=106, current_price=105,
+        fee_rate=0.001,
+    )
+    assert reason is None

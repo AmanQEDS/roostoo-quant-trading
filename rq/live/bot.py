@@ -567,6 +567,11 @@ class Bot:
                     peak_price=peak_px,
                     current_price=sell_px,
                     fee_rate=fee,
+                    take_profit_net_pct=(
+                        float(exit_cfg["take_profit_net_pct"])
+                        if exit_cfg.get("take_profit_net_pct") is not None
+                        else None
+                    ),
                     hard_loss_pct=float(exit_cfg.get("hard_loss_pct", 0.03)),
                     trail_activation_net_pct=float(
                         exit_cfg.get("trail_activation_net_pct", 0.05)

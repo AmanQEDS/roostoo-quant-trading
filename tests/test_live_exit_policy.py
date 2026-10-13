@@ -38,3 +38,87 @@ def test_peak_equity_is_monotonic_and_saved(tmp_path):
     bot.save()
     saved = json.loads(bot.state_path.read_text())
     assert saved["peak"] == 120.0
+
+
+def test_cycle_routes_take_profit_to_dry_run_order(monkeypatch):
+    from types import SimpleNamespace
+    import rq.live.bot as live_bot_module
+
+    bot = object.__new__(Bot)
+    tick = {
+        "BTC/USD": {
+            "LastPrice": 110.0,
+            "MaxBid": 110.0,
+            "MinAsk": 111.0,
+        }
+    }
+    wallet = {
+        "USD": {"Free": 100.0, "Lock": 0.0},
+        "BTC": {"Free": 1.0, "Lock": 0.0},
+    }
+    config = {
+        "mode": "test",
+        "position_exits": {
+            "enabled": True,
+            "take_profit_net_pct": 0.08,
+        },
+    }
+
+    monkeypatch.setattr(
+        live_bot_module.yaml, "safe_load", lambda _: config
+    )
+    monkeypatch.setattr(
+        live_bot_module, "short_trend_failure", lambda *a, **k: False
+    )
+
+    bot.dry = True
+    bot.api = SimpleNamespace(
+        ticker=lambda: tick,
+        balance=lambda: wallet,
+    )
+    bot.pairs = {
+        "BTC/USD": {
+            "Coin": "BTC",
+            "AssetType": "crypto",
+            "AmountPrecision": 6,
+        }
+    }
+    bot.state = {
+        "pool_cash": {"crypto": 100.0, "equity": 0.0},
+        "entries": {
+            "BTC": {
+                "entry_price": 100.0,
+                "peak_price_since_entry": 112.0,
+                "trough_price_since_entry": 100.0,
+                "mfe": 12.0,
+                "mae": 0.0,
+            }
+        },
+    }
+    bot.order_context = {
+        "equity": None,
+        "peak_equity": None,
+        "drawdown": None,
+        "dd_multiplier": None,
+    }
+    bot.freq = 30
+    bot.feed = SimpleNamespace(d={})
+    bot._liquidate_equities = lambda wallet, tick: None
+    bot.signals = lambda: pd.Series(dtype=float)
+    bot.save = lambda: None
+
+    orders = []
+
+    def fake_order(coin, side, qty, tick, reason=None):
+        orders.append((coin, side, qty, reason))
+        return True
+
+    bot._order = fake_order
+
+    Bot.cycle(bot)
+
+    assert len(orders) == 1
+    assert orders[0][0] == "BTC"
+    assert orders[0][1] == "SELL"
+    assert orders[0][2] > 0
+    assert orders[0][3] == "SELL_TAKE_PROFIT"

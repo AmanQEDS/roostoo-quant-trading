@@ -50,6 +50,10 @@ class ExitConfig:
     giveback_trigger_atr: float = 1.0
     giveback_fraction: float = 0.5
     donchian_n: int = 24
+    trend_ema_span: int = 10
+    ema_exit_span: int = 20
+    momentum_lookback: int = 8
+    max_holding_bars: int = 48
     partial_r: float = 1.5
     cooldown_bars: int = 6
     # Portfolio-level profit lock is opt-in and research-only by default.
@@ -57,12 +61,26 @@ class ExitConfig:
     portfolio_lock_activation: float = 500.0
     portfolio_lock_giveback: float = 0.35
     portfolio_lock_cooldown_bars: int = 6
+    hard_stop_net_pct: float = 0.06
+    profit_take_net_pct: float = 0.01
+    profit_activation_net_pct: float = 0.01
+    profit_liquidation_bars: int = 48
+    soft_time_bars: int = 96
+    soft_time_min_net_pct: float = 0.015
 
     def __post_init__(self):
-        if self.variant not in {f"X{i}" for i in range(8)}:
+        if self.variant not in {f"X{i}" for i in range(23)}:
             raise ValueError(f"unknown exit variant: {self.variant}")
         if self.atr_n < 1 or self.cooldown_bars < 0:
             raise ValueError("atr_n must be positive and cooldown_bars nonnegative")
+        if self.trend_ema_span < 2:
+            raise ValueError("trend_ema_span must be at least 2")
+        if self.ema_exit_span < 2:
+            raise ValueError("ema_exit_span must be at least 2")
+        if self.momentum_lookback < 1:
+            raise ValueError("momentum_lookback must be positive")
+        if self.max_holding_bars < 1:
+            raise ValueError("max_holding_bars must be at least 1")
         if self.chandelier_k <= 0 or not 0 < self.trailing_pct < 1:
             raise ValueError("invalid trailing-stop parameters")
         if not 0 < self.giveback_fraction < 1 or self.giveback_trigger_atr <= 0:
@@ -87,7 +105,8 @@ class BacktestResult:
 
 
 def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.DataFrame | None = None,
-                 exit_config: ExitConfig | None = None) -> BacktestResult:
+                 exit_config: ExitConfig | None = None,
+                 entry_allowed: pd.DataFrame | None = None) -> BacktestResult:
     cols = list(panel.close.columns)
     N, T = len(cols), len(panel.index)
     cls = np.array([CLS[panel.classes[c]] for c in cols])
@@ -96,6 +115,21 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     L = panel.low.values.astype(float)
     X = panel.exec_px.values.astype(float)
     atr_values = I.atr(panel.high, panel.low, panel.close, exit_config.atr_n if exit_config else 14).values
+    trend_ema = (
+        panel.close.ewm(span=exit_config.trend_ema_span, adjust=False).mean().values
+        if exit_config and exit_config.variant in {"X8", "X11"}
+        else None
+    )
+    ema_exit = (
+        panel.close.ewm(span=exit_config.ema_exit_span, adjust=False).mean().values
+        if exit_config and exit_config.variant in {"X12", "X14"}
+        else None
+    )
+    momentum_roc = (
+        panel.close.div(panel.close.shift(exit_config.momentum_lookback)).sub(1).values
+        if exit_config and exit_config.variant in {"X13", "X14"}
+        else None
+    )
     donchian_lows = {}
     if exit_config and exit_config.variant == "X5":
         for n in {exit_config.donchian_n}:
@@ -103,6 +137,10 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     TR = panel.tradable.values.astype(bool)
     TG = target.reindex(index=panel.index, columns=cols).fillna(0).values.astype(np.int8)
     SC = score.reindex(index=panel.index, columns=cols).values if score is not None else None
+    EA = (
+        entry_allowed.reindex(index=panel.index, columns=cols).fillna(False).values.astype(bool)
+        if entry_allowed is not None else None
+    )
     rc = pcfg.risk
     VS = vol_scale_matrix(panel, rc)
     R = np.log(np.where(C > 0, C, np.nan)); R = np.vstack([np.full((1, N), np.nan), np.diff(R, axis=0)])
@@ -121,6 +159,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     trailing_stop = np.full(N, -np.inf)
     partial_taken = np.zeros(N, dtype=bool); cooldown_until = np.full(N, -1, dtype=int)
     trade_ids = np.zeros(N, dtype=np.int64)
+    profit_seen_bar = np.full(N, -1, dtype=int)
     position_ids = np.zeros(N, dtype=np.int64)
     position_initial_qty = np.zeros(N)
     next_trade_id = 1
@@ -215,6 +254,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                        "mfe_atr": mfe / (q[j] * entry_atr[j]) if q[j] > 0 and entry_atr[j] > 0 else np.nan,
                        "profitable_1atr_loser": bool(entry_atr[j] > 0 and mfe >= q[j] * entry_atr[j] and net_pnl < 0)})
         q[j] = entry[j] = collat[j] = e_fee[j] = 0.0
+        profit_seen_bar[j] = -1
         peak_high[j] = trough_low[j] = entry_atr[j] = 0.0
         trailing_stop[j] = -np.inf
         partial_taken[j] = False
@@ -232,6 +272,9 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
         net_exposure[i] = (side * q * px).sum()
         realized_curve[i] = realized_total
         unrealized_curve[i] = unrealized_net(px)
+        # Preserve the prior completed-bar peak for X22 before updating
+        # excursions with the current bar.
+        prior_peak_high = peak_high.copy()
         # Maintain per-position excursions through the latest completed bar.
         active = side == 1
         peak_high[active] = np.maximum(peak_high[active], H[i, active])
@@ -289,6 +332,273 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 a = atr_values[i, j]
                 a = float(a) if np.isfinite(a) and a > 0 else entry_atr[j]
                 stop = -np.inf
+
+                # X15: completed-bar research exit only.
+                if v == "X15":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+
+                    if a > 0:
+                        trailing_stop[j] = max(
+                            trailing_stop[j], peak_high[j] - exit_config.chandelier_k * a
+                        )
+
+                    bars_held = i + 1 - e_bar[j]
+
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X15"
+                    elif (
+                        bars_held >= exit_config.soft_time_bars
+                        and net_mark_return < exit_config.soft_time_min_net_pct
+                    ):
+                        force[j] = True
+                        reason[j] = "soft_time_cap_X15"
+                    elif C[i, j] < trailing_stop[j]:
+                        force[j] = True
+                        reason[j] = "chandelier_X15"
+
+                # X17: original signal exits plus emergency hard stop only.
+                # Research-only; no Chandelier or time-cap exit.
+                if v == "X17":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X17"
+
+                # X18: 8% emergency hard stop plus conditional time exit.
+                # Research-only; original entry signals remain unchanged.
+                if v == "X18":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+                    bars_held = i + 1 - e_bar[j]
+
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X18"
+                    elif (
+                        bars_held >= exit_config.soft_time_bars
+                        and net_mark_return < exit_config.soft_time_min_net_pct
+                    ):
+                        force[j] = True
+                        reason[j] = "soft_time_X18"
+
+                # X21: X18 plus profit-activated ATR trailing stop.
+                # Research-only. Preserve X18 hard stop and conditional timer.
+                if v == "X21":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+                    bars_held = i + 1 - e_bar[j]
+
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X21"
+                    elif (
+                        bars_held >= exit_config.soft_time_bars
+                        and net_mark_return < exit_config.soft_time_min_net_pct
+                    ):
+                        force[j] = True
+                        reason[j] = "soft_time_X21"
+                    elif (
+                        entry_atr[j] > 0
+                        and peak_high[j] - entry[j]
+                        >= exit_config.breakeven_atr * entry_atr[j]
+                    ):
+                        if a > 0:
+                            trailing_stop[j] = max(
+                                trailing_stop[j],
+                                peak_high[j] - exit_config.chandelier_k * a,
+                            )
+                        if C[i, j] < trailing_stop[j]:
+                            force[j] = True
+                            reason[j] = "chandelier_X21"
+
+
+                # X22: X18 plus a one-bar-lagged, profit-activated ATR trail.
+                # Research-only; avoid updating and triggering the trail
+                # from the same bar's high/ATR.
+                if v == "X22":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+                    bars_held = i + 1 - e_bar[j]
+
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X22"
+                    elif (
+                        bars_held >= exit_config.soft_time_bars
+                        and net_mark_return < exit_config.soft_time_min_net_pct
+                    ):
+                        force[j] = True
+                        reason[j] = "soft_time_X22"
+                    elif (
+                        entry_atr[j] > 0
+                        and i > 0
+                        and i > 0
+                        and prior_peak_high[j] - entry[j]
+                        >= exit_config.breakeven_atr * entry_atr[j]
+                    ):
+                        prior_atr = atr_values[i - 1, j]
+                        prior_atr = (
+                            float(prior_atr)
+                            if np.isfinite(prior_atr) and prior_atr > 0
+                            else entry_atr[j]
+                        )
+                        prior_peak = prior_peak_high[j]
+                        if prior_atr > 0:
+                            trailing_stop[j] = max(
+                                trailing_stop[j],
+                                prior_peak - exit_config.chandelier_k * prior_atr,
+                            )
+                        if C[i, j] < trailing_stop[j]:
+                            force[j] = True
+                            reason[j] = "chandelier_X22"
+
+                # X19: research-only hard stop plus net-profit target.
+                # Original entry signals remain unchanged.
+                if v == "X19":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X19"
+                    elif net_mark_return >= exit_config.profit_take_net_pct:
+                        force[j] = True
+                        reason[j] = "profit_take_X19"
+
+                # X20: start the timer at the first net-profit activation.
+                # Exit after the configured delay even if profit later fades.
+                # The hard stop takes priority. Research-only; entries unchanged.
+                if v == "X20":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X20"
+                    else:
+                        if (
+                            profit_seen_bar[j] < 0
+                            and net_mark_return >= exit_config.profit_activation_net_pct
+                        ):
+                            profit_seen_bar[j] = i
+
+                        if (
+                            profit_seen_bar[j] >= 0
+                            and i - profit_seen_bar[j] >= exit_config.profit_liquidation_bars
+                        ):
+                            force[j] = True
+                            reason[j] = "profit_time_exit_X20"
+
+                # X16: preserve original signal exits; add hard stop and
+                # profit-activated Chandelier. Research-only, completed bars.
+                if v == "X16":
+                    net_mark_return = (
+                        C[i, j] * (1.0 - fee) /
+                        (entry[j] * (1.0 + fee))
+                    ) - 1.0
+
+                    if net_mark_return <= -exit_config.hard_stop_net_pct:
+                        force[j] = True
+                        reason[j] = "hard_stop_X16"
+                    elif (
+                        entry_atr[j] > 0
+                        and peak_high[j] - entry[j]
+                        >= exit_config.breakeven_atr * entry_atr[j]
+                    ):
+                        if a > 0:
+                            trailing_stop[j] = max(
+                                trailing_stop[j],
+                                peak_high[j] - exit_config.chandelier_k * a,
+                            )
+                        if C[i, j] < trailing_stop[j]:
+                            force[j] = True
+                            reason[j] = "chandelier_X16"
+
+                if (
+                    v == "X14"
+                    and ema_exit is not None
+                    and momentum_roc is not None
+                    and np.isfinite(C[i, j])
+                    and np.isfinite(ema_exit[i, j])
+                    and np.isfinite(momentum_roc[i, j])
+                    and C[i, j] < ema_exit[i, j]
+                    and momentum_roc[i, j] < 0
+                ):
+                    force[j] = True
+                    reason[j] = "ema_momentum_exit_X14"
+                if (
+                    v == "X13"
+                    and momentum_roc is not None
+                    and i > 0
+                    and np.isfinite(momentum_roc[i, j])
+                    and np.isfinite(momentum_roc[i - 1, j])
+                    and momentum_roc[i - 1, j] >= 0
+                    and momentum_roc[i, j] < 0
+                ):
+                    force[j] = True
+                    reason[j] = "momentum_reversal_X13"
+                if (
+                    v == "X12"
+                    and ema_exit is not None
+                    and np.isfinite(C[i, j])
+                    and np.isfinite(ema_exit[i, j])
+                    and C[i, j] < ema_exit[i, j]
+                ):
+                    force[j] = True
+                    reason[j] = "ema20_exit_X12"
+                if (
+                    v == "X11"
+                    and i > 0
+                    and i - e_bar[j] >= exit_config.max_holding_bars
+                    and C[i, j] <= entry[j] * (1 + 2 * fee)
+                    and trend_ema is not None
+                    and np.isfinite(C[i, j])
+                    and np.isfinite(trend_ema[i, j])
+                    and np.isfinite(trend_ema[i - 1, j])
+                    and C[i, j] < trend_ema[i, j]
+                    and trend_ema[i, j] < trend_ema[i - 1, j]
+                ):
+                    force[j] = True
+                    reason[j] = "stale_loss_trend_exit_X11"
+                if (
+                    v == "X10"
+                    and i - e_bar[j] >= exit_config.max_holding_bars
+                    and C[i, j] <= entry[j] * (1 + 2 * fee)
+                ):
+                    force[j] = True
+                    reason[j] = "stale_loss_exit_X10"
+                if v == "X9" and i - e_bar[j] >= exit_config.max_holding_bars:
+                    force[j] = True
+                    reason[j] = "time_exit_X9"
+                if (
+                    v == "X8"
+                    and i > 0
+                    and trend_ema is not None
+                    and np.isfinite(C[i, j])
+                    and np.isfinite(trend_ema[i, j])
+                    and np.isfinite(trend_ema[i - 1, j])
+                    and C[i, j] < trend_ema[i, j]
+                    and trend_ema[i, j] < trend_ema[i - 1, j]
+                ):
+                    force[j] = True
+                    reason[j] = "ema_trend_failure_X8"
                 if v in {"X1", "X6", "X7"} and a > 0:
                     trailing_stop[j] = max(trailing_stop[j], peak_high[j] - exit_config.chandelier_k * a)
                     stop = max(stop, trailing_stop[j])
@@ -343,7 +653,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                             # Give the remaining tranche its own unique trade id for audit integrity.
                             trade_ids[j] = next_trade_id; next_trade_id += 1
                             partial_taken[j] = True
-                if np.isfinite(stop) and C[i, j] <= stop:
+                if v != "X15" and np.isfinite(stop) and C[i, j] <= stop:
                     force[j] = True; reason[j] = f"protective_{v}"
                 if force[j]:
                     blocked[j] = side[j]
@@ -403,7 +713,8 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
             )
 
         # ---- entries, highest score first, sequential on remaining pool cash
-        cand = np.flatnonzero(need & (desired != 0) & (side == 0))
+        entry_mask = EA[i] if EA is not None else np.ones(N, dtype=bool)
+        cand = np.flatnonzero(need & (desired != 0) & (side == 0) & entry_mask)
         if len(cand) and not halted:
             if SC is not None:
                 s = np.nan_to_num(SC[i, cand], nan=-1e9); cand = cand[np.argsort(-s, kind="stable")]
@@ -445,6 +756,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 nt = qty * price; f = fee * nt
                 cash[c] -= nt + f        # long: pay notional+fee; short: lock collateral(=nt) + open fee
                 q[j], entry[j], side[j], e_fee[j], e_bar[j] = qty, price, d, f, i + 1
+                profit_seen_bar[j] = -1
                 peak_high[j] = trough_low[j] = price
                 entry_atr[j] = float(atr_values[i, j]) if np.isfinite(atr_values[i, j]) and atr_values[i, j] > 0 else price * 0.02
                 partial_taken[j] = False
