@@ -125,3 +125,17 @@ def test_x3_trailing_exit_records_mfe_mae_and_giveback():
     assert trade.mae <= 0
     assert trade.giveback == pytest.approx(trade.mfe - trade.pnl_net)
     assert bool(trade.profitable_1atr_loser) == (trade.mfe >= trade.qty * trade.entry_atr and trade.pnl_net < 0)
+
+
+def test_x6_partial_take_profit_banks_half_and_keeps_a_trailing_remainder():
+    p = mini_panel({"A": [100, 100, 110, 110, 110, 100, 100, 100]})
+    target = tgt(p, {"A": [1, 1, 1, 1, 1, 0, 0, 0]})
+    r = run_backtest(p, target, cfg(pos_frac=0.5),
+                     exit_config=ExitConfig(variant="X6", partial_r=1.5, chandelier_k=3.0))
+    assert (r.trades.reason == "partial_tp_X6").sum() == 1
+    assert (r.trades.reason == "protective_X6").sum() == 1
+    assert r.trades.trade_id.is_unique
+    partial = r.trades[r.trades.reason == "partial_tp_X6"].iloc[0]
+    remainder = r.trades[r.trades.reason == "protective_X6"].iloc[0]
+    assert partial.qty == pytest.approx(remainder.qty)
+    assert partial.pnl_net > 0
