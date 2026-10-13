@@ -106,6 +106,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
     q = np.zeros(N); entry = np.zeros(N); collat = np.zeros(N); side = np.zeros(N, dtype=np.int8)
     blocked = np.zeros(N, dtype=np.int8); e_fee = np.zeros(N); e_bar = np.zeros(N, dtype=int)
     peak_high = np.zeros(N); trough_low = np.zeros(N); entry_atr = np.zeros(N)
+    trailing_stop = np.full(N, -np.inf)
     partial_taken = np.zeros(N, dtype=bool); cooldown_until = np.full(N, -1, dtype=int)
     trade_ids = np.zeros(N, dtype=np.int64)
     position_ids = np.zeros(N, dtype=np.int64)
@@ -167,6 +168,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                        "profitable_1atr_loser": bool(entry_atr[j] > 0 and mfe >= q[j] * entry_atr[j] and net_pnl < 0)})
         q[j] = entry[j] = collat[j] = e_fee[j] = 0.0
         peak_high[j] = trough_low[j] = entry_atr[j] = 0.0
+        trailing_stop[j] = -np.inf
         partial_taken[j] = False
         side[j] = 0; trade_ids[j] = 0; position_ids[j] = 0; position_initial_qty[j] = 0.0
 
@@ -207,7 +209,8 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                 a = float(a) if np.isfinite(a) and a > 0 else entry_atr[j]
                 stop = -np.inf
                 if v in {"X1", "X6", "X7"} and a > 0:
-                    stop = max(stop, peak_high[j] - exit_config.chandelier_k * a)
+                    trailing_stop[j] = max(trailing_stop[j], peak_high[j] - exit_config.chandelier_k * a)
+                    stop = max(stop, trailing_stop[j])
                 if v in {"X2", "X7"} and entry_atr[j] > 0:
                     if peak_high[j] - entry[j] >= exit_config.breakeven_atr * entry_atr[j]:
                         stop = max(stop, entry[j] * (1 + 2 * fee))
