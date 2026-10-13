@@ -230,6 +230,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                             part_pnl_gross = partial_qty * (price - entry[j])
                             cash[cls[j]] += partial_qty * price - part_fee
                             fees_total += part_fee; turnover += partial_qty * price
+                            realized_total += part_pnl_gross - part_fee - part_entry_fee
                             trades.append({
                                 "trade_id": int(trade_ids[j]), "asset": cols[j], "class": panel.classes[cols[j]],
                                 "side": 1, "entry_time": idx[e_bar[j]], "exit_time": idx[min(i + 1, T - 1)],
@@ -256,6 +257,7 @@ def run_backtest(panel, target: pd.DataFrame, pcfg: PortfolioConfig, score: pd.D
                             partial_taken[j] = True
                 if np.isfinite(stop) and C[i, j] <= stop:
                     force[j] = True; reason[j] = f"protective_{v}"
+                if force[j]:
                     blocked[j] = side[j]
                     cooldown_until[j] = i + exit_config.cooldown_bars
 
