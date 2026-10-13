@@ -34,6 +34,13 @@ def should_exit_held(coin, target, mode="run") -> bool:
     return mode == "liquidate" or (coin in target.index and target.get(coin, 0) <= 0)
 
 
+def update_peak_equity(state: dict, equity: float) -> float:
+    """Keep the historical equity high-water mark monotonic across cycles/restarts."""
+    peak = max(float(state.get("peak", equity)), float(equity))
+    state["peak"] = peak
+    return peak
+
+
 class Feed:
     """Rolling 5m klines per crypto coin from Binance REST."""
 
@@ -484,12 +491,7 @@ class Bot:
             )
         )
 
-        peak = max(
-            self.state.get("peak", eq),
-            eq,
-        )
-
-        self.state["peak"] = peak
+        peak = update_peak_equity(self.state, eq)
 
         if not self.dry:
             self.save()
