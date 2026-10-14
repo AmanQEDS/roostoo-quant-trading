@@ -366,7 +366,10 @@ def recover_from_execution_journal(
         lots: list[dict[str, Any]] = []
         total_bought = 0.0
         position_quantity = 0.0
-        average_basis = 0.0
+        average_basis = 0.0  # gross weighted fill price used by X18
+        average_cost_basis = 0.0  # fee-inclusive quote cost per remaining coin
+        entry_fees_quote = 0.0
+        entry_fees_base = 0.0
         ambiguous = False
         for record in sorted(
             coin_orders,
@@ -402,14 +405,21 @@ def recover_from_execution_journal(
                 if acquired_quantity <= 0:
                     ambiguous = True
                     break
-                effective_price = quote_cost / acquired_quantity
+                quote_fee = fee_amount if fee_coin == "USD" else 0.0
+                base_fee = fee_amount if fee_coin == coin else 0.0
                 total_bought += acquired_quantity
                 average_basis = (
-                    (position_quantity * average_basis + acquired_quantity * effective_price)
+                    (position_quantity * average_basis + acquired_quantity * price)
                     / (position_quantity + acquired_quantity)
                 )
+                average_cost_basis = (
+                    (position_quantity * average_cost_basis + quote_cost)
+                    / (position_quantity + acquired_quantity)
+                )
+                entry_fees_quote += quote_fee
+                entry_fees_base += base_fee
                 position_quantity += acquired_quantity
-                lots.append({"quantity": acquired_quantity, "price": effective_price, "timestamp": record["first_fill_timestamp"]})
+                lots.append({"quantity": acquired_quantity, "price": price, "timestamp": record["first_fill_timestamp"]})
                 continue
             sold_quantity = quantity
             if fee_amount > 0 and fee_coin == coin:
@@ -430,6 +440,9 @@ def recover_from_execution_journal(
             if position_quantity <= 1e-12:
                 position_quantity = 0.0
                 average_basis = 0.0
+                average_cost_basis = 0.0
+                entry_fees_quote = 0.0
+                entry_fees_base = 0.0
                 total_bought = 0.0
 
         wallet_quantity = _balance_quantity(wallet[coin])
@@ -483,6 +496,9 @@ def recover_from_execution_journal(
         recovered_metadata = {
             **(current_meta if isinstance(current_meta, dict) else {}),
             "entry_price": basis,
+            "entry_cost_basis": average_cost_basis,
+            "entry_fees_quote": entry_fees_quote,
+            "entry_fees_base": entry_fees_base,
             "remaining_quantity": wallet_quantity,
             "entry_quantity": total_bought,
             "entry_ts": entry_ts,
@@ -566,11 +582,19 @@ def apply_manual_reconciliation(
         elif unknown_timestamp:
             raise ValueError(f"{coin}: entry_ts and entry_timestamp_unknown cannot both be set")
 
+        if "entry_cost_basis" in record:
+            entry_cost_basis = _finite_positive(record.get("entry_cost_basis"))
+            if entry_cost_basis is None:
+                raise ValueError(f"{coin}: entry_cost_basis must be finite and positive")
+        else:
+            # Backward compatibility for previously documented manual records.
+            entry_cost_basis = entry_price
         canonical = {
             "record_id": record_id.strip(),
             "operator": operator.strip(),
             "source": source.strip(),
             "entry_price": entry_price,
+            "entry_cost_basis": entry_cost_basis,
             "remaining_quantity": quantity,
             "entry_ts": entry_ts,
             "entry_timestamp_unknown": unknown_timestamp,
@@ -582,8 +606,10 @@ def apply_manual_reconciliation(
             item for item in audit if item.get("record_id") == record_id
         ]
         if prior_audit:
+            prior_canonical = dict(prior_audit[0]) if len(prior_audit) == 1 else {}
+            prior_canonical.setdefault("entry_cost_basis", prior_canonical.get("entry_price"))
             if len(prior_audit) == 1 and prior_audit[0].get("coin") == coin and all(
-                prior_audit[0].get(key) == value
+                prior_canonical.get(key) == value
                 for key, value in canonical.items()
             ):
                 continue
@@ -621,6 +647,7 @@ def apply_manual_reconciliation(
         entries[coin] = {
             **previous_metadata,
             "entry_price": entry_price,
+            "entry_cost_basis": entry_cost_basis,
             "remaining_quantity": quantity,
             "entry_quantity": max(quantity, _finite_positive(previous_metadata.get("entry_quantity")) or 0),
             "entry_ts": entry_ts,

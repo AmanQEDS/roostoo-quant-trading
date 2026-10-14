@@ -1258,6 +1258,7 @@ If the journal cannot establish the position basis and quantity, verify them fro
       "operator": "reviewer name",
       "source": "Roostoo fill history; order IDs 12345 and 12346",
       "entry_price": 62000.5,
+      "entry_cost_basis": 62100.0,
       "remaining_quantity": 0.0125,
       "entry_ts": "2026-10-01T12:30:00Z"
     }
@@ -1265,7 +1266,7 @@ If the journal cannot establish the position basis and quantity, verify them fro
 }
 ```
 
-Use one symbol per position. `entry_price` must be the verified weighted cost basis in quote currency; `remaining_quantity` must equal the current exchange free-plus-locked quantity at the exchange's supported amount precision; `entry_ts` must be the verified, timezone-aware original entry time. `record_id`, `operator`, and an evidence `source` are required. The bot validates the pair, values, timestamp and wallet quantity before updating `entries`; it appends the prior metadata and attestation to `reconciliation_audit`. A record ID is idempotent and cannot be reused with changed data. Invalid input fails closed; the reconciliation flag is not cleared.
+Use one symbol per position. `entry_price` is the verified weighted average fill price used by X18 trigger calculations; `entry_cost_basis` is the fee-inclusive quote cost per remaining coin and must be verified from fills and commission records. `remaining_quantity` must equal the current exchange free-plus-locked quantity at the exchange's supported amount precision; `entry_ts` must be the verified, timezone-aware original entry time. `record_id`, `operator`, and an evidence `source` are required. The bot validates the pair, values, timestamp and wallet quantity before updating `entries`; it appends the prior metadata and attestation to `reconciliation_audit`. A record ID is idempotent and cannot be reused with changed data. Invalid input fails closed; the reconciliation flag is not cleared.
 
 If the original entry time cannot be established, **do not fabricate one**. Explicitly attest that fact and accept the conservative fallback below:
 
@@ -1277,6 +1278,7 @@ If the original entry time cannot be established, **do not fabricate one**. Expl
       "operator": "reviewer name",
       "source": "Roostoo fill history confirms basis; original fill time unavailable",
       "entry_price": 62000.5,
+      "entry_cost_basis": 62100.0,
       "remaining_quantity": 0.0125,
       "entry_ts": null,
       "entry_timestamp_unknown": true,
@@ -1299,7 +1301,7 @@ python3 -m pytest -q
 python3 -m rq.cli live --dry-run
 ```
 
-The dry run queries read-only order history and reports which held positions were recovered and which remain unresolved. It must not submit orders or write the production ledger. If a position remains unresolved, independently verify order IDs, filled quantities, weighted cost basis including quote fees, remaining exchange quantity, and original fill time from Roostoo history. Stop the bot before editing `state/reconciliation_manual.json` and follow the attestation schema above. Repeat the dry run and verify every held symbol and quantity. The live process persists successful reconciliation and its audit trail in `state/ledger.json`; do not manually clear `reconciliation_required`. If history is unavailable or pagination is truncated, reconciliation fails closed.
+The dry run queries read-only order history and reports which held positions were recovered and which remain unresolved. It must not submit orders or write the production ledger. If a position remains unresolved, independently verify order IDs, filled quantities, weighted fill price, fee-inclusive cost basis, remaining exchange quantity, and original fill time from Roostoo history. Stop the bot before editing `state/reconciliation_manual.json` and follow the attestation schema above. Repeat the dry run and verify every held symbol and quantity. The live process persists successful reconciliation and its audit trail in `state/ledger.json`; do not manually clear `reconciliation_required`. If history is unavailable or pagination is truncated, reconciliation fails closed.
 
 ### 18.6 Start gate
 

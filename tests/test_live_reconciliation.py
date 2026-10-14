@@ -814,7 +814,9 @@ def test_exchange_order_matched_history_recovers_four_holdings_and_quote_fees(tm
     assert set(recovered) == set(holdings)
     for coin, qty in holdings.items():
         assert entries[coin]["remaining_quantity"] == pytest.approx(qty)
-        assert entries[coin]["entry_price"] == pytest.approx(prices[coin] * 1.001)
+        assert entries[coin]["entry_price"] == pytest.approx(prices[coin])
+        assert entries[coin]["entry_cost_basis"] == pytest.approx(prices[coin] * 1.001)
+        assert entries[coin]["entry_fees_quote"] == pytest.approx(qty * prices[coin] * 0.001)
         assert entries[coin]["entry_ts"] is not None
         assert entries[coin]["entry_source"]["type"] == "exchange_order_history"
     held, unresolved = reconcile_crypto_holdings(wallet, pairs, entries, required)
