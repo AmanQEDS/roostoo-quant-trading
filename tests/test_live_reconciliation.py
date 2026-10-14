@@ -864,7 +864,7 @@ def test_no_history_keeps_all_four_holdings_unresolved():
     assert all(required[coin]["reason"] == "missing_verified_entry_cost_basis" for coin in holdings)
 
 
-def test_bot_suppresses_exit_when_exchange_quantity_mismatches_ledger(tmp_path):
+def test_bot_suppresses_exit_when_exchange_quantity_mismatches_ledger(tmp_path, caplog):
     cfg_path = tmp_path / "live.yaml"
     cfg_path.write_text(
         "mode: run\ncrypto_weight: 1.0\npos_frac: 0.1\n"
@@ -898,10 +898,12 @@ def test_bot_suppresses_exit_when_exchange_quantity_mismatches_ledger(tmp_path):
     assert bot.state["reconciliation_required"]["BTC"]["reason"] == "exchange_local_quantity_mismatch"
     assert "unreconciled exchange holdings" in bot._entry_freeze_reasons
     assert submitted == []
+    assert "RECONCILIATION REQUIRED DETAIL" in caplog.text
+    assert '"reason": "exchange_local_quantity_mismatch"' in caplog.text
     assert ledger.read_bytes() == before
 
 
-def test_dry_run_queries_exchange_history_and_reconciles_four_holdings_without_orders(tmp_path):
+def test_dry_run_queries_exchange_history_and_reconciles_four_holdings_without_orders(tmp_path, caplog):
     holdings = {"BTC": 0.08992, "CAKE": 3011.12, "EDEN": 111203.6, "FIL": 5786.78}
     prices = {"BTC": 50000.0, "CAKE": 10.0, "EDEN": 0.2, "FIL": 4.0}
     cfg_path = tmp_path / "live.yaml"
@@ -958,6 +960,9 @@ def test_dry_run_queries_exchange_history_and_reconciles_four_holdings_without_o
     assert not set(holdings).intersection(bot.state.get("reconciliation_required", {}))
     assert all(bot.state["reconciliation_history"][coin]["status"] == "queried" for coin in holdings)
     assert {event["coin"] for event in bot.state["reconciliation_audit"] if event.get("action") == "automatic_position_recovery"} == set(holdings)
+    for coin in holdings:
+        assert f"POSITION RECOVERY DETAIL" in caplog.text
+        assert f'"coin": "{coin}"' in caplog.text
     assert ledger.read_bytes() == before
 
 

@@ -717,6 +717,18 @@ class Bot:
                     "remaining_quantity": meta.get("remaining_quantity"),
                     "entry_ts": meta.get("entry_ts"),
                 })
+                # Dry-run intentionally does not persist ledger mutations, so
+                # emit the verified recovered metadata for operator review.
+                log.info("POSITION RECOVERY DETAIL %s", json.dumps({
+                    "coin": coin,
+                    "entry_price": meta.get("entry_price"),
+                    "entry_cost_basis": meta.get("entry_cost_basis"),
+                    "remaining_quantity": meta.get("remaining_quantity"),
+                    "entry_ts": meta.get("entry_ts"),
+                    "entry_fees_quote": meta.get("entry_fees_quote"),
+                    "entry_fees_base": meta.get("entry_fees_base"),
+                    "entry_source": meta.get("entry_source"),
+                }, sort_keys=True))
             log.warning(
                 "POSITION HISTORY RECOVERED from persisted/exchange order records: %s",
                 ", ".join(sorted(recovered)),
@@ -760,6 +772,19 @@ class Bot:
                 "ENTRY FREEZE: exchange holdings require manual reconciliation: %s",
                 ", ".join(sorted(unresolved)),
             )
+            for coin in unresolved:
+                marker = reconciliation_required.get(coin, {})
+                diagnostic = history_diagnostics.get(coin, {})
+                log.critical("RECONCILIATION REQUIRED DETAIL %s", json.dumps({
+                    "coin": coin,
+                    "reason": marker.get("reason") if isinstance(marker, dict) else "unknown",
+                    "observed_quantity": marker.get("observed_quantity") if isinstance(marker, dict) else None,
+                    "ledger_quantity": (
+                        entries.get(coin, {}).get("remaining_quantity")
+                        if isinstance(entries.get(coin), dict) else None
+                    ),
+                    "history": diagnostic,
+                }, sort_keys=True))
 
         for coin in held:
             meta = entries.get(coin, {})
