@@ -147,7 +147,8 @@ class RoostooClient:
         return self._ok(self._request("POST", "/v3/place_order", p, signed=True, attempts=1))["OrderDetail"]
 
     def query_order(self, order_id: str | None = None, pair: str | None = None,
-                    pending_only: bool | None = None) -> dict:
+                    pending_only: bool | None = None, offset: int | None = None,
+                    limit: int | None = None) -> dict:
         p: dict[str, str] = {}
         if order_id:
             p["order_id"] = str(order_id)
@@ -156,7 +157,32 @@ class RoostooClient:
                 p["pair"] = pair
             if pending_only is not None:
                 p["pending_only"] = "TRUE" if pending_only else "FALSE"
-        return self._ok(self._request("POST", "/v3/query_order", p, signed=True))
+            if offset is not None:
+                p["offset"] = str(offset)
+            if limit is not None:
+                p["limit"] = str(limit)
+        try:
+            return self._ok(self._request("POST", "/v3/query_order", p, signed=True))
+        except RoostooError as exc:
+            if "no order matched" in str(exc).lower():
+                return {"Success": True, "OrderMatched": []}
+            raise
+
+    def fetch_all_orders(self, pending_only: bool = False, max_pages: int = 10,
+                         limit: int = 100) -> list[dict[str, Any]]:
+        """Fetch all orders from the exchange across paginated query_order calls."""
+        orders: list[dict[str, Any]] = []
+        offset = 0
+        for _ in range(max_pages):
+            resp = self.query_order(pending_only=pending_only, offset=offset, limit=limit)
+            batch = resp.get("OrderMatched", [])
+            if not isinstance(batch, list) or not batch:
+                break
+            orders.extend(batch)
+            if len(batch) < limit:
+                break
+            offset += len(batch)
+        return orders
 
     def cancel_order(self, order_id: str | None = None, pair: str | None = None) -> dict:
         p = {"order_id": str(order_id)} if order_id else ({"pair": pair} if pair else {})

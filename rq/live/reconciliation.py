@@ -46,15 +46,35 @@ def _valid_entry_price(meta: Any) -> bool:
 
 
 def _aware_timestamp(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.strip():
+    if value is None:
         return None
-    try:
-        timestamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
-        return None
-    return timestamp.astimezone(timezone.utc).isoformat()
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value) or value <= 0:
+            return None
+        sec = value / 1000.0 if value > 1e11 else float(value)
+        try:
+            return datetime.fromtimestamp(sec, tz=timezone.utc).isoformat()
+        except (ValueError, OverflowError, OSError):
+            return None
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return None
+        try:
+            num = float(v)
+            if math.isfinite(num) and num > 0:
+                sec = num / 1000.0 if num > 1e11 else num
+                return datetime.fromtimestamp(sec, tz=timezone.utc).isoformat()
+        except ValueError:
+            pass
+        try:
+            timestamp = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                return None
+            return timestamp.astimezone(timezone.utc).isoformat()
+        except ValueError:
+            return None
+    return None
 
 
 def _quantity_tolerance(quantity: float, pair_info: dict[str, Any]) -> float:
@@ -213,7 +233,14 @@ def _order_detail(response: Any) -> dict[str, Any] | None:
 
 
 def _detail_fill_timestamp(detail: dict[str, Any]) -> str | None:
-    for key in ("FilledTime", "LastFilledTime", "TransactTime"):
+    for key in (
+        "FinishTimestamp",
+        "CreateTimestamp",
+        "FilledTime",
+        "LastFilledTime",
+        "TransactTime",
+        "timestamp",
+    ):
         timestamp = _aware_timestamp(detail.get(key))
         if timestamp is not None:
             return timestamp
@@ -287,7 +314,7 @@ def recover_from_execution_journal(
             record["pair"] = detail.get("Pair") or params.get("pair") or record["pair"]
             side = detail.get("Side") or params.get("side") or record["side"]
             record["side"] = str(side).upper() if side is not None else None
-            if api_path == "/v3/place_order":
+            if api_path in {"/v3/place_order", "/v3/query_order"}:
                 record["submitted"] = True
             previous_detail = record["detail"]
             record["detail"] = (
@@ -296,9 +323,13 @@ def recover_from_execution_journal(
                 else detail
             )
             cumulative_fill = _finite_nonnegative(detail.get("FilledQuantity"))
-            if cumulative_fill is not None and cumulative_fill > 0 and not record["first_fill_observed"]:
-                record["first_fill_observed"] = True
-                record["first_fill_timestamp"] = _detail_fill_timestamp(detail)
+            if cumulative_fill is not None and cumulative_fill > 0:
+                ts = _detail_fill_timestamp(detail)
+                if ts is not None and not record["first_fill_observed"]:
+                    record["first_fill_observed"] = True
+                    record["first_fill_timestamp"] = ts
+                elif record["first_fill_timestamp"] is None and ts is not None:
+                    record["first_fill_timestamp"] = ts
 
     by_coin: dict[str, list[dict[str, Any]]] = {}
     for record in orders.values():
@@ -467,6 +498,241 @@ def recover_from_execution_journal(
                     if isinstance(metric, (int, float)) and math.isfinite(metric):
                         recovered_metadata[key] = metric
         entries[coin] = recovered_metadata
+        marker = reconciliation_required.get(coin)
+        if not isinstance(marker, dict) or marker.get("reason") in _RECONCILABLE_REASONS:
+            reconciliation_required.pop(coin, None)
+        recovered.append(coin)
+    return recovered
+
+
+def recover_from_exchange_orders(
+    api_or_orders: Any,
+    wallet: dict[str, Any],
+    pairs: dict[str, Any],
+    entries: dict[str, Any],
+    reconciliation_required: dict[str, Any],
+) -> list[str]:
+    """Recover positions from the exchange's authoritative order history."""
+    if api_or_orders is None:
+        return []
+    orders: list[dict[str, Any]] = []
+    if isinstance(api_or_orders, list):
+        orders = api_or_orders
+    elif hasattr(api_or_orders, "fetch_all_orders"):
+        try:
+            orders = api_or_orders.fetch_all_orders(pending_only=False)
+        except Exception:
+            orders = []
+    elif hasattr(api_or_orders, "query_order"):
+        try:
+            resp = api_or_orders.query_order(pending_only=False)
+            if isinstance(resp, dict):
+                matched = resp.get("OrderMatched", [])
+                if isinstance(matched, list):
+                    orders = matched
+        except Exception:
+            orders = []
+
+    if not orders:
+        return []
+
+    coin_orders_map: dict[str, dict[str, Any]] = {}
+    for raw in orders:
+        if not isinstance(raw, dict):
+            continue
+        detail = _order_detail(raw)
+        if detail is None:
+            continue
+        order_id = detail.get("OrderID") or raw.get("order_id")
+        if order_id is None:
+            continue
+        order_id = str(order_id)
+        pair = detail.get("Pair") or raw.get("pair")
+        side = detail.get("Side") or raw.get("side")
+        if not isinstance(pair, str) or not side:
+            continue
+        side = str(side).upper()
+        if side not in {"BUY", "SELL"}:
+            continue
+        filled = _finite_nonnegative(detail.get("FilledQuantity"))
+        price = _finite_positive(detail.get("FilledAverPrice"))
+        if filled is None or filled <= 0 or price is None:
+            continue
+        ts = _detail_fill_timestamp(detail)
+        raw_ts = _finite_nonnegative(detail.get("FinishTimestamp") or detail.get("CreateTimestamp"))
+        record = coin_orders_map.setdefault(
+            order_id,
+            {
+                "order_id": order_id,
+                "first_seen": raw_ts,
+                "detail": detail,
+                "pair": pair,
+                "side": side,
+                "submitted": True,
+                "first_fill_observed": True,
+                "first_fill_timestamp": ts,
+            },
+        )
+        prev_filled = _finite_nonnegative(record["detail"].get("FilledQuantity")) or 0
+        if filled >= prev_filled:
+            record["detail"] = detail
+            record["first_fill_timestamp"] = ts or record["first_fill_timestamp"]
+
+    by_coin: dict[str, list[dict[str, Any]]] = {}
+    for record in coin_orders_map.values():
+        pair = record["pair"]
+        side = str(record["side"] or "").upper()
+        coin = pair.split("/", 1)[0]
+        if pair != f"{coin}/USD":
+            continue
+        if coin not in wallet or _balance_quantity(wallet[coin]) <= 0:
+            continue
+        by_coin.setdefault(coin, []).append(record)
+
+    recovered: list[str] = []
+    for coin, coin_orders in by_coin.items():
+        pair = f"{coin}/USD"
+        pair_info = pairs.get(pair)
+        if not isinstance(pair_info, dict) or pair_info.get("AssetType") != "crypto" or not pair_info.get("CanTrade"):
+            continue
+        current_meta = entries.get(coin)
+        if (
+            isinstance(current_meta, dict)
+            and current_meta.get("manual_reconciliation")
+            and _valid_entry_price(current_meta)
+        ):
+            continue
+
+        lots: list[dict[str, Any]] = []
+        total_bought = 0.0
+        position_quantity = 0.0
+        average_basis = 0.0
+        ambiguous = False
+        for record in sorted(
+            coin_orders,
+            key=lambda item: item["first_seen"] or float("inf"),
+        ):
+            detail = record["detail"]
+            quantity = _finite_nonnegative(detail.get("FilledQuantity"))
+            price = _finite_positive(detail.get("FilledAverPrice"))
+            if quantity is None or quantity <= 0 or price is None:
+                continue
+            if record["side"] == "BUY":
+                total_bought += quantity
+                average_basis = (
+                    (position_quantity * average_basis + quantity * price)
+                    / (position_quantity + quantity)
+                )
+                position_quantity += quantity
+                lots.append(
+                    {
+                        "quantity": quantity,
+                        "price": price,
+                        "timestamp": record["first_fill_timestamp"],
+                    }
+                )
+                continue
+            remaining_to_sell = quantity
+            while remaining_to_sell > 1e-12 and lots:
+                consumed = min(remaining_to_sell, lots[0]["quantity"])
+                lots[0]["quantity"] -= consumed
+                remaining_to_sell -= consumed
+                if lots[0]["quantity"] <= 1e-12:
+                    lots.pop(0)
+            if remaining_to_sell > 1e-12:
+                ambiguous = True
+                break
+            position_quantity = max(0.0, position_quantity - quantity)
+            if position_quantity <= 1e-12:
+                position_quantity = 0.0
+                average_basis = 0.0
+
+        wallet_quantity = _balance_quantity(wallet[coin])
+        reconstructed_quantity = sum(lot["quantity"] for lot in lots)
+        tolerance = _quantity_tolerance(wallet_quantity, pair_info)
+        if (
+            ambiguous
+            or reconstructed_quantity <= 0
+            or abs(reconstructed_quantity - wallet_quantity) > tolerance
+        ):
+            reconciliation_required[coin] = {
+                "reason": "execution_history_quantity_mismatch",
+                "observed_quantity": wallet_quantity,
+                "execution_history_quantity": reconstructed_quantity,
+                "pair": pair,
+            }
+            continue
+
+        basis = average_basis
+        oldest_remaining = lots[0]
+        entry_ts = oldest_remaining["timestamp"]
+        basis_matches = True
+        if isinstance(current_meta, dict) and _valid_entry_price(current_meta):
+            local_quantity = _finite_positive(current_meta.get("remaining_quantity"))
+            quantity_matches = (
+                local_quantity is not None
+                and abs(local_quantity - wallet_quantity) <= tolerance
+            )
+            current_timestamp = _aware_timestamp(
+                current_meta.get("entry_signal_bar_ts") or current_meta.get("entry_ts")
+            )
+            basis_matches = math.isclose(
+                float(current_meta["entry_price"]),
+                basis,
+                rel_tol=1e-8,
+                abs_tol=1e-8,
+            )
+            if quantity_matches and not basis_matches:
+                reconciliation_required[coin] = {
+                    "reason": "execution_history_basis_mismatch",
+                    "observed_quantity": wallet_quantity,
+                    "ledger_entry_price": float(current_meta["entry_price"]),
+                    "execution_history_entry_price": basis,
+                    "pair": pair,
+                }
+                continue
+            if quantity_matches and current_timestamp is not None:
+                continue
+            if quantity_matches and entry_ts is None:
+                continue
+
+        recovered_metadata = {
+            **(current_meta if isinstance(current_meta, dict) else {}),
+            "entry_price": basis,
+            "remaining_quantity": wallet_quantity,
+            "entry_quantity": total_bought,
+            "entry_ts": entry_ts,
+            "entry_signal_bar_ts": entry_ts,
+            "peak_price_since_entry": basis,
+            "trough_price_since_entry": basis,
+            "mfe": 0.0,
+            "mae": 0.0,
+            "entry_source": {
+                "type": "exchange_order_history",
+                "order_ids": [record["order_id"] for record in coin_orders],
+            },
+        }
+        if entry_ts is not None:
+            recovered_metadata["entry_time_status"] = "verified"
+            recovered_metadata["time_exit_policy"] = "verified_timestamp"
+        if isinstance(current_meta, dict) and _valid_entry_price(current_meta):
+            if _finite_positive(current_meta.get("peak_price_since_entry")):
+                recovered_metadata["peak_price_since_entry"] = max(
+                    float(current_meta["peak_price_since_entry"]), basis
+                )
+            if _finite_positive(current_meta.get("trough_price_since_entry")):
+                recovered_metadata["trough_price_since_entry"] = min(
+                    float(current_meta["trough_price_since_entry"]), basis
+                )
+            if basis_matches:
+                for key in ("mfe", "mae"):
+                    metric = current_meta.get(key)
+                    if isinstance(metric, (int, float)) and math.isfinite(metric):
+                        recovered_metadata[key] = metric
+        entries[coin] = recovered_metadata
+        marker = reconciliation_required.get(coin)
+        if not isinstance(marker, dict) or marker.get("reason") in _RECONCILABLE_REASONS:
+            reconciliation_required.pop(coin, None)
         recovered.append(coin)
     return recovered
 

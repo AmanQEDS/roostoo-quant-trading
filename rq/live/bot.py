@@ -32,6 +32,7 @@ from .reconciliation import (
     apply_manual_reconciliation,
     execution_journal_scope,
     reconcile_crypto_holdings,
+    recover_from_exchange_orders,
     recover_from_execution_journal,
 )
 from .regime_filter import f2_regime
@@ -614,6 +615,18 @@ class Bot:
         audit = self.state.setdefault("reconciliation_audit", [])
         if not isinstance(audit, list):
             raise ValueError("ledger reconciliation_audit must be a list")
+        recovered_exchange = recover_from_exchange_orders(
+            self.api,
+            wallet,
+            self.pairs,
+            entries,
+            reconciliation_required,
+        )
+        if recovered_exchange:
+            log.warning(
+                "POSITION HISTORY RECOVERED from exchange order history: %s",
+                ", ".join(sorted(recovered_exchange)),
+            )
         recovered = recover_from_execution_journal(
             getattr(self.api, "journal", None),
             wallet,

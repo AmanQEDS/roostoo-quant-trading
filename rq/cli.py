@@ -1,4 +1,4 @@
-﻿"""python -m rq.cli <command>   (see README for the full workflow)"""
+"""python -m rq.cli <command>   (see README for the full workflow)"""
 from __future__ import annotations
 
 import argparse, itertools, json, logging
@@ -107,6 +107,11 @@ def main(argv=None):
     lv.add_argument("--dry-run", action="store_true")
     lv.add_argument("--confirm", action="store_true")
 
+    rc = sub.add_parser("reconcile", help="inspect or perform position reconciliation")
+    rc.add_argument("--dry-run", action="store_true")
+    rc.add_argument("--confirm", action="store_true")
+    rc.add_argument("--manual", default=None, help="path to manual reconciliation JSON file")
+
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -134,6 +139,67 @@ def main(argv=None):
 
     if args.cmd == "freeze":
         print(json.dumps(lock.freeze(args.names), indent=1))
+        return
+
+    if args.cmd == "reconcile":
+        from .roostoo.client import RoostooClient
+        from .live.reconciliation import (
+            recover_from_exchange_orders,
+            recover_from_execution_journal,
+            apply_manual_reconciliation,
+            reconcile_crypto_holdings,
+            execution_journal_scope,
+            _balance_quantity,
+        )
+        api = RoostooClient()
+        api.sync_clock()
+        info = api.exchange_info()
+        pairs = info.get("TradePairs", {})
+        wallet = api.balance()
+        state_path = Path("state/ledger.json")
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state = (
+            json.loads(state_path.read_text(encoding="utf-8"))
+            if state_path.exists()
+            else {"pool_cash": {"crypto": 0.0, "equity": 0.0}, "entries": {}}
+        )
+        entries = state.setdefault("entries", {})
+        reconciliation_required = state.setdefault("reconciliation_required", {})
+        audit = state.setdefault("reconciliation_audit", [])
+
+        rec_ex = recover_from_exchange_orders(api, wallet, pairs, entries, reconciliation_required)
+        rec_jr = recover_from_execution_journal(
+            getattr(api, "journal", None),
+            wallet, pairs, entries, reconciliation_required,
+            account_scope=execution_journal_scope(getattr(api, "key", "")),
+        )
+        manual_path = Path(args.manual) if args.manual else state_path.with_name("reconciliation_manual.json")
+        rec_man = []
+        if manual_path.exists():
+            doc = json.loads(manual_path.read_text(encoding="utf-8"))
+            rec_man = apply_manual_reconciliation(doc, wallet, pairs, entries, reconciliation_required, audit)
+
+        held, unresolved = reconcile_crypto_holdings(wallet, pairs, entries, reconciliation_required)
+
+        print("\n=== POSITION RECONCILIATION AUDIT ===")
+        print(f"{'Coin':<8} {'Held Qty':<14} {'Status':<12} {'Cost Basis':<14} {'Entry Time':<28} {'Source / Reason'}")
+        print("-" * 95)
+        for coin, qty in sorted(held.items()):
+            meta = entries.get(coin, {})
+            is_res = coin not in unresolved
+            status_str = "RESOLVED" if is_res else "UNRESOLVED"
+            basis_str = f"${meta.get('entry_price', 0):.4f}" if meta.get("entry_price") else "N/A"
+            ts_str = str(meta.get("entry_ts") or meta.get("time_exit_policy") or "missing")
+            src_str = meta.get("entry_source", {}).get("type") if is_res else reconciliation_required.get(coin, {}).get("reason", "unresolved")
+            print(f"{coin:<8} {qty:<14.8g} {status_str:<12} {basis_str:<14} {ts_str:<28} {src_str}")
+
+        if args.confirm:
+            tmp = state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+            tmp.replace(state_path)
+            print(f"\n[Confirmed] Saved reconciled state to {state_path}")
+        else:
+            print("\n[Dry-run] State file was NOT modified. Pass --confirm to persist reconciliation to state/ledger.json.")
         return
 
     if args.cmd == "live":

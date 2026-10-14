@@ -11,6 +11,7 @@ from rq.live.reconciliation import (
     apply_manual_reconciliation,
     execution_journal_scope,
     reconcile_crypto_holdings,
+    recover_from_exchange_orders,
     recover_from_execution_journal,
 )
 
@@ -772,3 +773,404 @@ def test_reported_dry_run_order_respects_cash_fraction_and_precision(tmp_path):
     )
     assert bot._order("S", "BUY", quantity + 0.1, ticker, "test") is False
     assert not bot.state_path.exists()
+
+
+def test_four_holdings_recovery_from_exchange_order_history():
+    """Verify BTC, CAKE, EDEN, and FIL recover from exchange OrderMatched history."""
+    wallet = {
+        "BTC": {"Free": 0.08992, "Lock": 0},
+        "CAKE": {"Free": 3011.12, "Lock": 0},
+        "EDEN": {"Free": 111203.6, "Lock": 0},
+        "FIL": {"Free": 5786.78, "Lock": 0},
+    }
+    pairs = {
+        "BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 5},
+        "CAKE/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 2},
+        "EDEN/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 1},
+        "FIL/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 2},
+    }
+    # Millisecond epoch timestamps matching Roostoo exchange responses
+    order_matched = [
+        {
+            "OrderID": 1001,
+            "Pair": "BTC/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 0.08992,
+            "FilledAverPrice": 62500.0,
+            "CreateTimestamp": 1728000000000,
+            "FinishTimestamp": 1728000001000,
+            "CommissionChargeValue": 5.62,
+        },
+        {
+            "OrderID": 1002,
+            "Pair": "CAKE/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 3011.12,
+            "FilledAverPrice": 2.15,
+            "CreateTimestamp": 1728000100000,
+            "FinishTimestamp": 1728000102000,
+            "CommissionChargeValue": 6.47,
+        },
+        {
+            "OrderID": 1003,
+            "Pair": "EDEN/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 111203.6,
+            "FilledAverPrice": 0.085,
+            "CreateTimestamp": 1728000200000,
+            "FinishTimestamp": 1728000203000,
+            "CommissionChargeValue": 9.45,
+        },
+        {
+            "OrderID": 1004,
+            "Pair": "FIL/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 5786.78,
+            "FilledAverPrice": 3.80,
+            "CreateTimestamp": 1728000300000,
+            "FinishTimestamp": 1728000304000,
+            "CommissionChargeValue": 21.99,
+        },
+    ]
+
+    entries = {}
+    reconciliation_required = {}
+    recovered = recover_from_exchange_orders(
+        order_matched,
+        wallet,
+        pairs,
+        entries,
+        reconciliation_required,
+    )
+    held, unresolved = reconcile_crypto_holdings(
+        wallet, pairs, entries, reconciliation_required
+    )
+
+    assert sorted(recovered) == ["BTC", "CAKE", "EDEN", "FIL"]
+    assert unresolved == []
+    assert reconciliation_required == {}
+    assert entries["BTC"]["entry_price"] == pytest.approx(62500.0)
+    assert entries["BTC"]["remaining_quantity"] == pytest.approx(0.08992)
+    assert entries["BTC"]["entry_ts"].startswith("2024-") or "+00:00" in entries["BTC"]["entry_ts"]
+    assert entries["CAKE"]["entry_price"] == pytest.approx(2.15)
+    assert entries["EDEN"]["entry_price"] == pytest.approx(0.085)
+    assert entries["FIL"]["entry_price"] == pytest.approx(3.80)
+
+
+def test_four_holdings_partial_fills_and_sells_fifo():
+    """Verify multi-order accumulation and FIFO sales across four holdings."""
+    wallet = {
+        "BTC": {"Free": 0.08992, "Lock": 0},
+        "CAKE": {"Free": 3011.12, "Lock": 0},
+    }
+    pairs = {
+        "BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 5},
+        "CAKE/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 2},
+    }
+    orders = [
+        # BTC: bought 0.1, sold 0.01008 -> remaining 0.08992
+        {
+            "OrderID": 1,
+            "Pair": "BTC/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 0.1,
+            "FilledAverPrice": 60000.0,
+            "FinishTimestamp": 1728000000000,
+        },
+        {
+            "OrderID": 2,
+            "Pair": "BTC/USD",
+            "Side": "SELL",
+            "Status": "FILLED",
+            "FilledQuantity": 0.01008,
+            "FilledAverPrice": 65000.0,
+            "FinishTimestamp": 1728001000000,
+        },
+        # CAKE: bought 2000 @ 2.0, bought 1011.12 @ 2.5 -> total 3011.12 @ VWAP
+        {
+            "OrderID": 3,
+            "Pair": "CAKE/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 2000.0,
+            "FilledAverPrice": 2.0,
+            "FinishTimestamp": 1728002000000,
+        },
+        {
+            "OrderID": 4,
+            "Pair": "CAKE/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 1011.12,
+            "FilledAverPrice": 2.5,
+            "FinishTimestamp": 1728003000000,
+        },
+    ]
+
+    entries = {}
+    required = {}
+    recovered = recover_from_exchange_orders(orders, wallet, pairs, entries, required)
+
+    assert sorted(recovered) == ["BTC", "CAKE"]
+    assert entries["BTC"]["remaining_quantity"] == pytest.approx(0.08992)
+    assert entries["BTC"]["entry_price"] == pytest.approx(60000.0)
+    expected_cake_basis = (2000.0 * 2.0 + 1011.12 * 2.5) / 3011.12
+    assert entries["CAKE"]["remaining_quantity"] == pytest.approx(3011.12)
+    assert entries["CAKE"]["entry_price"] == pytest.approx(expected_cake_basis)
+
+
+def test_four_holdings_unavailable_history_blocks_new_entries_and_never_autosells(tmp_path):
+    """When order history is missing, holdings are marked unresolved and new entries blocked."""
+    cfg_path = tmp_path / "live.yaml"
+    cfg_path.write_text(
+        "mode: run\ncrypto_weight: 1.0\npos_frac: 0.1\n"
+        "max_pos: {crypto: 5, equity: 0}\n"
+        "position_reconciliation: {unknown_basis_policy: manual_reconciliation_freeze_entries}\n"
+        "x18: {enabled: true, hard_stop_net_pct: 0.08, soft_time_bars: 216, "
+        "soft_time_min_net_pct: 0.015, cooldown_bars: 3}\n",
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "state" / "ledger.json"
+    ledger.parent.mkdir()
+    original = {
+        "pool_cash": {"crypto": 67812.17, "equity": 0.0},
+        "entries": {},
+        "peak": 100597.78934632,
+    }
+    ledger.write_text(json.dumps(original), encoding="utf-8")
+    before = ledger.read_bytes()
+
+    bot = object.__new__(Bot)
+    bot.cfg_path = cfg_path
+    bot.cfg = {}
+    bot.dry = True
+    bot.state_path = ledger
+    bot.state = json.loads(ledger.read_text(encoding="utf-8"))
+    bot.pairs = {
+        "BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 5, "MiniOrder": 5},
+        "CAKE/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 2, "MiniOrder": 5},
+        "EDEN/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 1, "MiniOrder": 5},
+        "FIL/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 2, "MiniOrder": 5},
+    }
+    bot.freq = 30
+    bot.api = SimpleNamespace(
+        ticker=lambda: {
+            "BTC/USD": {"LastPrice": 60000, "MaxBid": 59990, "MinAsk": 60010},
+            "CAKE/USD": {"LastPrice": 2.0, "MaxBid": 1.99, "MinAsk": 2.01},
+            "EDEN/USD": {"LastPrice": 0.08, "MaxBid": 0.079, "MinAsk": 0.081},
+            "FIL/USD": {"LastPrice": 3.5, "MaxBid": 3.49, "MinAsk": 3.51},
+        },
+        balance=lambda: {
+            "USD": {"Free": 67812.17, "Lock": 0},
+            "BTC": {"Free": 0.08992, "Lock": 0},
+            "CAKE": {"Free": 3011.12, "Lock": 0},
+            "EDEN": {"Free": 111203.6, "Lock": 0},
+            "FIL": {"Free": 5786.78, "Lock": 0},
+        },
+        query_order=lambda *args, **kwargs: {"Success": True, "OrderMatched": []},
+        journal=None,
+        place_order=lambda *args: pytest.fail("unverified holdings must not trigger market sales"),
+    )
+    bot.signals = lambda: (_ for _ in ()).throw(RuntimeError("feed offline"))
+
+    bot.cycle()
+
+    for coin in ("BTC", "CAKE", "EDEN", "FIL"):
+        assert bot.state["reconciliation_required"][coin]["reason"] == "missing_verified_entry_cost_basis"
+    assert "unreconciled exchange holdings" in bot._entry_freeze_reasons[0]
+    assert ledger.read_bytes() == before
+
+
+def test_four_holdings_manual_reconciliation_and_restart_persistence(tmp_path):
+    """Manual reconciliation survives process restart and disables time exit for attested unknown timestamps."""
+    ledger_path = tmp_path / "state" / "ledger.json"
+    ledger_path.parent.mkdir()
+    original = {
+        "pool_cash": {"crypto": 67812.17, "equity": 0.0},
+        "entries": {},
+        "peak": 100597.78934632,
+    }
+    ledger_path.write_text(json.dumps(original), encoding="utf-8")
+
+    manual_path = tmp_path / "state" / "reconciliation_manual.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "positions": {
+                    "BTC": {
+                        "record_id": "ec2-btc-20261014",
+                        "operator": "operator",
+                        "source": "exchange order 101",
+                        "entry_price": 62500.0,
+                        "remaining_quantity": 0.08992,
+                        "entry_ts": "2026-10-14T08:30:00Z",
+                    },
+                    "CAKE": {
+                        "record_id": "ec2-cake-20261014",
+                        "operator": "operator",
+                        "source": "exchange order 102",
+                        "entry_price": 2.15,
+                        "remaining_quantity": 3011.12,
+                        "entry_ts": "2026-10-14T08:35:00Z",
+                    },
+                    "EDEN": {
+                        "record_id": "ec2-eden-20261014",
+                        "operator": "operator",
+                        "source": "exchange order 103; fill time unavailable",
+                        "entry_price": 0.085,
+                        "remaining_quantity": 111203.6,
+                        "entry_ts": None,
+                        "entry_timestamp_unknown": True,
+                        "time_exit_policy": UNKNOWN_TIME_POLICY,
+                    },
+                    "FIL": {
+                        "record_id": "ec2-fil-20261014",
+                        "operator": "operator",
+                        "source": "exchange order 104",
+                        "entry_price": 3.80,
+                        "remaining_quantity": 5786.78,
+                        "entry_ts": "2026-10-14T08:40:00Z",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    pairs = {
+        "BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 5, "MiniOrder": 5},
+        "CAKE/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 2, "MiniOrder": 5},
+        "EDEN/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 1, "MiniOrder": 5},
+        "FIL/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 2, "MiniOrder": 5},
+    }
+    wallet = {
+        "USD": {"Free": 67812.17, "Lock": 0},
+        "BTC": {"Free": 0.08992, "Lock": 0},
+        "CAKE": {"Free": 3011.12, "Lock": 0},
+        "EDEN": {"Free": 111203.6, "Lock": 0},
+        "FIL": {"Free": 5786.78, "Lock": 0},
+    }
+
+    # Step 1: Reconcile and save state
+    state = json.loads(ledger_path.read_text(encoding="utf-8"))
+    entries = state.setdefault("entries", {})
+    audit = state.setdefault("reconciliation_audit", [])
+    required = state.setdefault("reconciliation_required", {})
+
+    applied = apply_manual_reconciliation(
+        json.loads(manual_path.read_text(encoding="utf-8")),
+        wallet,
+        pairs,
+        entries,
+        required,
+        audit,
+    )
+    assert sorted(applied) == ["BTC", "CAKE", "EDEN", "FIL"]
+    assert len(audit) == 4
+
+    held, unresolved = reconcile_crypto_holdings(wallet, pairs, entries, required)
+    assert unresolved == []
+    assert required == {}
+
+    # Persist reconciled state to ledger
+    ledger_path.write_text(json.dumps(state, indent=1), encoding="utf-8")
+
+    # Step 2: Restart bot with the saved ledger
+    restarted_state = json.loads(ledger_path.read_text(encoding="utf-8"))
+    restarted_entries = restarted_state["entries"]
+    restarted_required = restarted_state.get("reconciliation_required", {})
+
+    restarted_held, restarted_unresolved = reconcile_crypto_holdings(
+        wallet, pairs, restarted_entries, restarted_required
+    )
+    assert restarted_unresolved == []
+    assert restarted_required == {}
+    assert restarted_entries["EDEN"]["entry_time_status"] == "unknown_operator_attested"
+    assert restarted_entries["EDEN"]["time_exit_policy"] == UNKNOWN_TIME_POLICY
+    assert restarted_entries["BTC"]["entry_time_status"] == "verified"
+
+
+def test_four_holdings_quantity_mismatch_blocks_and_preserves_reconciliation_flag():
+    """Manual reconciliation rejects quantity mismatch and preserves entry freeze."""
+    wallet = {"BTC": {"Free": 0.08992, "Lock": 0}}
+    pairs = {"BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 5}}
+    entries = {}
+    required = {"BTC": {"reason": "missing_verified_entry_cost_basis"}}
+    audit = []
+    document = {
+        "positions": {
+            "BTC": {
+                "record_id": "test-mismatch",
+                "operator": "reviewer",
+                "source": "incorrect source",
+                "entry_price": 62500.0,
+                "remaining_quantity": 0.05,
+                "entry_ts": "2026-10-14T08:30:00Z",
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="does not match exchange quantity"):
+        apply_manual_reconciliation(document, wallet, pairs, entries, required, audit)
+
+    assert "BTC" not in entries
+    assert required["BTC"]["reason"] == "missing_verified_entry_cost_basis"
+    assert audit == []
+
+
+def test_reconcile_cli_command(tmp_path, monkeypatch, capsys):
+    from rq.cli import main
+    class MockClient:
+        journal = None
+        key = "test-key"
+        def sync_clock(self): return 0
+        def exchange_info(self):
+            return {
+                "TradePairs": {
+                    "BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 5},
+                }
+            }
+        def balance(self):
+            return {"USD": {"Free": 1000, "Lock": 0}, "BTC": {"Free": 0.08992, "Lock": 0}}
+        def query_order(self, *args, **kwargs):
+            return {
+                "Success": True,
+                "OrderMatched": [
+                    {
+                        "OrderID": 999,
+                        "Pair": "BTC/USD",
+                        "Side": "BUY",
+                        "Status": "FILLED",
+                        "FilledQuantity": 0.08992,
+                        "FilledAverPrice": 62500.0,
+                        "FinishTimestamp": 1728000000000,
+                    }
+                ],
+            }
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "live.yaml").write_text("crypto_weight: 1.0\ntimeframes: ['30m']\n", encoding="utf-8")
+    monkeypatch.setattr("rq.roostoo.client.RoostooClient", MockClient)
+
+    # Dry-run
+    main(["reconcile"])
+    out = capsys.readouterr().out
+    assert "BTC" in out
+    assert "RESOLVED" in out
+    assert "$62500.0000" in out
+    assert "Dry-run" in out
+    assert not (tmp_path / "state" / "ledger.json").exists()
+
+    # Confirm
+    main(["reconcile", "--confirm"])
+    out2 = capsys.readouterr().out
+    assert "[Confirmed]" in out2
+    ledger_saved = json.loads((tmp_path / "state" / "ledger.json").read_text(encoding="utf-8"))
+    assert ledger_saved["entries"]["BTC"]["entry_price"] == 62500.0
+    assert ledger_saved["entries"]["BTC"]["remaining_quantity"] == 0.08992
