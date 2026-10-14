@@ -899,3 +899,63 @@ def test_bot_suppresses_exit_when_exchange_quantity_mismatches_ledger(tmp_path):
     assert "unreconciled exchange holdings" in bot._entry_freeze_reasons
     assert submitted == []
     assert ledger.read_bytes() == before
+
+
+def test_dry_run_queries_exchange_history_and_reconciles_four_holdings_without_orders(tmp_path):
+    holdings = {"BTC": 0.08992, "CAKE": 3011.12, "EDEN": 111203.6, "FIL": 5786.78}
+    prices = {"BTC": 50000.0, "CAKE": 10.0, "EDEN": 0.2, "FIL": 4.0}
+    cfg_path = tmp_path / "live.yaml"
+    cfg_path.write_text(
+        "mode: run\ncrypto_weight: 1.0\npos_frac: 0.1\n"
+        "max_pos: {crypto: 5, equity: 0}\n"
+        "position_reconciliation: {unknown_basis_policy: manual_reconciliation_freeze_entries}\n"
+        "x18: {enabled: true, hard_stop_net_pct: 0.08, soft_time_bars: 216, "
+        "soft_time_min_net_pct: 0.015, cooldown_bars: 3}\n",
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "state" / "ledger.json"
+    ledger.parent.mkdir()
+    state = {"pool_cash": {"crypto": 1000.0, "equity": 0.0}, "entries": {}}
+    ledger.write_text(json.dumps(state), encoding="utf-8")
+    before = ledger.read_bytes()
+    pairs = {
+        f"{coin}/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 8, "MiniOrder": 5}
+        for coin in holdings
+    }
+    wallet = {"USD": {"Free": 1000, "Lock": 0}}
+    ticker = {}
+    for coin, qty in holdings.items():
+        price = prices[coin]
+        wallet[coin] = {"Free": qty, "Lock": 0}
+        ticker[f"{coin}/USD"] = {"LastPrice": price * 1.1, "MaxBid": price * 1.1, "MinAsk": price * 1.101}
+    history_calls = []
+    def query_order_history(*, pair):
+        history_calls.append(pair)
+        coin = pair.split("/", 1)[0]
+        qty, price = holdings[coin], prices[coin]
+        return [{
+            "OrderID": 100 + len(history_calls), "Pair": pair, "Side": "BUY", "Status": "FILLED",
+            "FilledQuantity": qty, "FilledAverPrice": price,
+            "CommissionCoin": "USD", "CommissionChargeValue": qty * price * 0.001,
+            "CommissionPercent": 0.001, "CreateTimestamp": 1790841600000,
+            "FinishTimestamp": 1790841601000,
+        }]
+    bot = object.__new__(Bot)
+    bot.cfg_path, bot.cfg, bot.dry, bot.state_path, bot.state = cfg_path, {}, True, ledger, state
+    bot.pairs, bot.freq = pairs, 30
+    bot.api = SimpleNamespace(
+        key="test-key", journal=None, ticker=lambda: ticker, balance=lambda: wallet,
+        query_order_history=query_order_history,
+        place_order=lambda *args: pytest.fail("dry-run must never submit a real order"),
+    )
+    bot.signals = lambda: (_ for _ in ()).throw(RuntimeError("feed unavailable"))
+
+    bot.cycle()
+
+    assert set(history_calls) == {f"{coin}/USD" for coin in holdings}
+    assert set(bot.state["entries"]) == set(holdings)
+    assert set(bot._held_quantities) == set(holdings)
+    assert not set(holdings).intersection(bot.state.get("reconciliation_required", {}))
+    assert all(bot.state["reconciliation_history"][coin]["status"] == "queried" for coin in holdings)
+    assert {event["coin"] for event in bot.state["reconciliation_audit"] if event.get("action") == "automatic_position_recovery"} == set(holdings)
+    assert ledger.read_bytes() == before
