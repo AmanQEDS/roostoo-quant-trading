@@ -11,8 +11,10 @@ from rq.live.reconciliation import (
     apply_manual_reconciliation,
     execution_journal_scope,
     reconcile_crypto_holdings,
+    recover_from_exchange_orders,
     recover_from_execution_journal,
 )
+from rq.roostoo.client import RoostooClient
 
 
 def test_empty_ledger_marks_exchange_holding_for_manual_basis_reconciliation():
@@ -919,6 +921,94 @@ def test_exchange_order_matched_history_recovers_four_holdings_and_quote_fees(tm
     held, unresolved = reconcile_crypto_holdings(wallet, pairs, entries, required)
     assert set(held) == set(holdings)
     assert unresolved == []
+
+
+def test_paginated_roostoo_order_history_recovers_basis_quantity_and_fill_time():
+    client = RoostooClient(
+        api_key="test-account",
+        secret="test-secret",
+        journal=None,
+        min_interval_s=0,
+    )
+    order_history = [
+        {
+            "OrderID": 101,
+            "Pair": "BTC/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 1.0,
+            "FilledAverPrice": 100.0,
+            "CommissionCoin": "USD",
+            "CommissionChargeValue": 0.1,
+            "CommissionPercent": 0.001,
+            "CreateTimestamp": 1790841600000,
+            "FinishTimestamp": 1790841601000,
+        },
+        {
+            "OrderID": 102,
+            "Pair": "BTC/USD",
+            "Side": "BUY",
+            "Status": "FILLED",
+            "FilledQuantity": 2.0,
+            "FilledAverPrice": 110.0,
+            "CommissionCoin": "USD",
+            "CommissionChargeValue": 0.22,
+            "CommissionPercent": 0.001,
+            "CreateTimestamp": 1790928000000,
+            "FinishTimestamp": 1790928001000,
+        },
+    ]
+    responses = [
+        {"Success": True, "OrderMatched": order_history[:1]},
+        {"Success": True, "OrderMatched": order_history[1:]},
+        {"Success": False, "ErrMsg": "no order matched"},
+    ]
+    sent_forms = []
+
+    class CapturingSession:
+        def request(self, method, url, *, headers, params, data, timeout):
+            from urllib.parse import parse_qs
+
+            sent_forms.append(parse_qs(data, strict_parsing=True))
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: responses.pop(0),
+            )
+
+    client.s = CapturingSession()
+    query_history = client.query_order_history
+    client.query_order_history = lambda *, pair: query_history(pair, limit=1)
+    wallet = {"BTC": {"Free": 3.0, "Lock": 0.0}}
+    pairs = {
+        "BTC/USD": {
+            "AssetType": "crypto",
+            "CanTrade": True,
+            "AmountPrecision": 8,
+        }
+    }
+    entries, required = {}, {}
+
+    recovered = recover_from_exchange_orders(
+        client, wallet, pairs, entries, required
+    )
+    held, unresolved = reconcile_crypto_holdings(
+        wallet, pairs, entries, required
+    )
+
+    assert recovered == ["BTC"]
+    assert held == {"BTC": pytest.approx(3.0)}
+    assert unresolved == []
+    assert entries["BTC"]["entry_price"] == pytest.approx(106.6666666667)
+    assert entries["BTC"]["entry_cost_basis"] == pytest.approx(106.7733333333)
+    assert entries["BTC"]["remaining_quantity"] == pytest.approx(3.0)
+    assert entries["BTC"]["entry_ts"] == pd.Timestamp(
+        1790841601000, unit="ms", tz="UTC"
+    ).isoformat()
+    assert entries["BTC"]["entry_source"]["type"] == "exchange_order_history"
+    assert "offset" not in sent_forms[0]
+    assert sent_forms[1]["offset"] == ["1"]
+    assert sent_forms[2]["offset"] == ["2"]
+    assert all(form["pending_only"] == ["FALSE"] for form in sent_forms)
 
 
 def test_query_history_backfills_timestamp_from_filled_finish_timestamp(tmp_path):

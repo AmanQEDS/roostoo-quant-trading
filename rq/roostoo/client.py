@@ -197,10 +197,17 @@ class RoostooClient:
         found: dict[str, dict] = {}
         offset = 0
         for _ in range(int(max_pages)):
+            params = {
+                "pair": pair,
+                "limit": str(int(limit)),
+                "pending_only": "FALSE",
+            }
+            # Roostoo's query_order contract makes offset optional. Its API
+            # rejects an explicit offset=0, so use the default for page one.
+            if offset:
+                params["offset"] = str(offset)
             response = self._request(
-                "POST", "/v3/query_order",
-                {"pair": pair, "offset": offset, "limit": int(limit), "pending_only": "FALSE"},
-                signed=True,
+                "POST", "/v3/query_order", params, signed=True,
             )
             if not isinstance(response, dict):
                 raise RoostooError("invalid query-order history response")

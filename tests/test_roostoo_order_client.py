@@ -1,4 +1,5 @@
 import json
+from urllib.parse import parse_qs
 
 import pytest
 import requests
@@ -33,6 +34,16 @@ class SuccessfulOrderResponse:
 class SuccessfulOrderSession:
     def request(self, *args, **kwargs):
         return SuccessfulOrderResponse()
+
+
+class OrderHistoryResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
 
 
 def test_place_order_timeout_is_not_retried():
@@ -99,9 +110,59 @@ def test_query_order_history_reads_order_matched_and_paginates():
     orders = client.query_order_history("BTC/USD", limit=2)
     assert [order["OrderID"] for order in orders] == [1, 2]
     assert calls[0][1] == "/v3/query_order"
-    assert calls[0][2]["pending_only"] == "FALSE"
-    assert calls[1][2]["offset"] == 2
+    assert calls[0][2] == {
+        "pair": "BTC/USD",
+        "limit": "2",
+        "pending_only": "FALSE",
+    }
+    assert calls[1][2]["offset"] == "2"
     assert all(call[3] for call in calls)
+
+
+def test_query_order_history_sends_documented_form_parameters_without_zero_offset():
+    client = RoostooClient(
+        api_key="test-key",
+        secret="test-secret",
+        journal=None,
+        min_interval_s=0,
+    )
+    requests_sent = []
+    responses = [
+        {"Success": True, "OrderMatched": [
+            {"OrderID": 1, "Pair": "BTC/USD", "FilledQuantity": 1},
+            {"OrderID": 2, "Pair": "BTC/USD", "FilledQuantity": 1},
+        ]},
+        {"Success": False, "ErrMsg": "no order matched"},
+    ]
+
+    class CapturingSession:
+        def request(self, method, url, *, headers, params, data, timeout):
+            requests_sent.append({
+                "method": method,
+                "url": url,
+                "params": params,
+                "data": data,
+            })
+            return OrderHistoryResponse(responses.pop(0))
+
+    client.s = CapturingSession()
+    assert len(client.query_order_history("BTC/USD", limit=2)) == 2
+
+    first, second = requests_sent
+    assert first["method"] == second["method"] == "POST"
+    assert first["url"].endswith("/v3/query_order")
+    assert first["params"] is second["params"] is None
+    first_form = parse_qs(first["data"], strict_parsing=True)
+    second_form = parse_qs(second["data"], strict_parsing=True)
+    assert first_form["pair"] == ["BTC/USD"]
+    assert first_form["limit"] == ["2"]
+    assert first_form["pending_only"] == ["FALSE"]
+    assert "offset" not in first_form
+    assert second_form["pair"] == ["BTC/USD"]
+    assert second_form["limit"] == ["2"]
+    assert second_form["pending_only"] == ["FALSE"]
+    assert second_form["offset"] == ["2"]
+    assert all("timestamp" in form for form in (first_form, second_form))
 
 
 def test_query_order_history_fails_closed_on_incomplete_pagination():
