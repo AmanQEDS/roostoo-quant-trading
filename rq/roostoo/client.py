@@ -71,8 +71,11 @@ class RoostooClient:
                 query = total
         else:
             query = params or None
+        max_attempts = self.max_retries if attempts is None else attempts
+        if max_attempts < 1:
+            raise ValueError("attempts must be at least 1")
         last_err: Exception | None = None
-        for attempt in range(attempts or self.max_retries):
+        for attempt in range(max_attempts):
             wait = self.min_interval - (time.time() - self._last_call)
             if wait > 0:
                 time.sleep(wait)
@@ -88,14 +91,15 @@ class RoostooClient:
                            "params": {k: v for k, v in params.items() if k != "timestamp"},
                            "http": r.status_code, "latency_s": round(time.time() - t0, 4),
                            "resp": data})
-                if r.status_code >= 500:
+                if r.status_code >= 400:
                     raise RoostooError(f"HTTP {r.status_code}")
                 return data
             except (requests.RequestException, ValueError, RoostooError) as e:
                 last_err = e
                 self._log({"t": time.time(), "method": method, "path": path, "error": repr(e),
                            "attempt": attempt})
-                time.sleep(min(2 ** attempt, 8))
+                if attempt + 1 < max_attempts:
+                    time.sleep(min(2 ** attempt, 8))
         raise RoostooError(f"{method} {path} failed after retries: {last_err}")
 
     @staticmethod
@@ -149,7 +153,7 @@ class RoostooClient:
                 p["pair"] = pair
             if pending_only is not None:
                 p["pending_only"] = "TRUE" if pending_only else "FALSE"
-        return self._request("POST", "/v3/query_order", p, signed=True)
+        return self._ok(self._request("POST", "/v3/query_order", p, signed=True))
 
     def cancel_order(self, order_id: str | None = None, pair: str | None = None) -> dict:
         p = {"order_id": str(order_id)} if order_id else ({"pair": pair} if pair else {})

@@ -20,4 +20,6 @@ x18:
   soft_time_bars: 216
   soft_time_min_net_pct: 0.015
   cooldown_bars: 3
+position_reconciliation:
+  unknown_basis_policy: manual_reconciliation_freeze_entries
 start_utc: "2026-10-03 00:00"

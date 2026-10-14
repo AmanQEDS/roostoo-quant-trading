@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -20,11 +21,13 @@ import yaml
 
 from ..constants import TAKER_FEE, FREQ_MINUTES
 from ..data.panel import build_panel
-from ..execution import plan_entry, plan_exit
+from ..execution import floor_qty, plan_entry, plan_exit
 from ..roostoo.client import RoostooClient
 from ..signals.core import to_target
 from ..research.runner import ALL_BUILDERS
+from .instance_lock import InstanceLock
 from .position_exits import position_exit_reason, short_trend_failure
+from .reconciliation import reconcile_crypto_holdings
 from .regime_filter import f2_regime
 from .x18 import completed_bars_held, x18_exit_reason
 
@@ -44,37 +47,101 @@ def update_peak_equity(state: dict, equity: float) -> float:
     return peak
 
 
+def _finite_float(value, default=0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return result if math.isfinite(result) else default
+
+
 class Feed:
     """Rolling 5m klines per crypto coin from Binance REST."""
 
-    def __init__(self, coins: list[str], warm_bars: int = 9000):
+    interval_ms = 5 * 60 * 1000
+
+    def __init__(
+        self,
+        coins: list[str],
+        warm_bars: int = 9000,
+        max_retries: int = 3,
+        timeout: float = 15.0,
+    ):
+        if warm_bars <= 0 or max_retries < 1 or timeout <= 0:
+            raise ValueError("warm_bars, max_retries and timeout must be positive")
         self.coins, self.warm, self.d = coins, warm_bars, {}
+        self.max_retries, self.timeout = max_retries, timeout
 
     def _fetch(self, sym, start_ms=None, limit=1000):
         p = {"symbol": sym, "interval": "5m", "limit": limit}
-        if start_ms:
+        if start_ms is not None:
             p["startTime"] = start_ms
 
-        r = requests.get(KL, params=p, timeout=15)
-        r.raise_for_status()
+        response = None
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.get(KL, params=p, timeout=self.timeout)
+                if response.status_code in (418, 429):
+                    if attempt + 1 == self.max_retries:
+                        response.raise_for_status()
+                    try:
+                        retry_after = float(response.headers.get("Retry-After", 0))
+                    except (TypeError, ValueError):
+                        retry_after = 0.0
+                    delay = min(max(retry_after, min(2**attempt, 8)), 30)
+                    log.warning(
+                        "Binance rate limited %s batch; retry %d/%d in %.1fs",
+                        sym, attempt + 1, self.max_retries - 1, delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                response.raise_for_status()
+                break
+            except requests.RequestException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status is not None and 400 <= status < 500 and status not in (418, 429):
+                    raise
+                if attempt + 1 == self.max_retries:
+                    raise
+                delay = min(2**attempt, 8)
+                log.warning(
+                    "Binance request failed for %s batch; retry %d/%d in %.1fs",
+                    sym, attempt + 1, self.max_retries - 1, delay,
+                    exc_info=True,
+                )
+                time.sleep(delay)
 
-        df = pd.DataFrame(
-            r.json(),
-            columns=[
-                "t",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "ct",
-                "qv",
-                "n",
-                "taker_buy_base",
-                "tbq",
-                "ig",
-            ],
-        )
+        if response is None:
+            raise RuntimeError(f"Binance returned no response for {sym}")
+
+        payload = response.json()
+        columns = [
+            "t",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "ct",
+            "qv",
+            "n",
+            "taker_buy_base",
+            "tbq",
+            "ig",
+        ]
+        if not payload:
+            empty = pd.DataFrame(
+                columns=["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base"],
+                index=pd.DatetimeIndex([], tz="UTC", name="open_time"),
+            )
+            return empty
+        if not isinstance(payload, list) or any(
+            not isinstance(row, (list, tuple)) or len(row) < len(columns)
+            for row in payload
+        ):
+            raise ValueError(f"Malformed Binance kline response for {sym}")
+
+        df = pd.DataFrame(payload, columns=columns)
 
         df["open_time"] = pd.to_datetime(df.t, unit="ms", utc=True)
 
@@ -90,13 +157,17 @@ class Feed:
             ]
         ].astype(float)
 
-        return df.rename(columns={"qv": "quote_volume"})
+        return df.rename(columns={"qv": "quote_volume"}).sort_index()
 
     def update(self):
-        now = pd.Timestamp.utcnow()
+        now = pd.Timestamp.now(tz="UTC")
+        update_started = time.perf_counter()
+        total_requests = 0
 
-        for c in list(self.coins):
+        for symbol_index, c in enumerate(list(self.coins), start=1):
             sym = f"{c}USDT"
+            symbol_started = time.perf_counter()
+            symbol_requests = 0
 
             try:
                 if c not in self.d or len(self.d[c]) == 0:
@@ -108,24 +179,69 @@ class Feed:
                     )
 
                     parts = []
+                    requested_bars = 0
+                    max_pages = max(1, (self.warm + 999) // 1000)
 
-                    while True:
-                        df = self._fetch(sym, start)
+                    for page_index in range(1, max_pages + 1):
+                        limit = min(1000, self.warm - requested_bars)
+                        if limit <= 0:
+                            break
+                        request_started = time.perf_counter()
+                        df = self._fetch(sym, start, limit=limit)
+                        latency = time.perf_counter() - request_started
+                        symbol_requests += 1
+                        total_requests += 1
                         parts.append(df)
-
-                        if len(df) < 1000:
+                        log.info(
+                            "feed batch symbol=%s batch=%d/%d rows=%d latency=%.3fs",
+                            sym, page_index, max_pages, len(df), latency,
+                        )
+                        if df.empty:
+                            log.error(
+                                "feed pagination stopped for %s after %d/%d bars: empty batch",
+                                sym, requested_bars, self.warm,
+                            )
                             break
 
-                        start = (
-                            int(df.index[-1].timestamp() * 1000) + 1
+                        last_ms = int(df.index[-1].timestamp() * 1000)
+                        next_start = last_ms + self.interval_ms
+                        requested_bars += len(df)
+                        if next_start <= start:
+                            log.error(
+                                "feed pagination stopped for %s: non-advancing startTime %s",
+                                sym, next_start,
+                            )
+                            break
+                        if len(df) < limit:
+                            break
+                        start = next_start
+
+                    if parts:
+                        self.d[c] = (
+                            pd.concat(parts)
+                            .loc[lambda frame: ~frame.index.duplicated(keep="last")]
+                            .sort_index()
+                            .tail(self.warm)
+                        )
+                    else:
+                        self.d[c] = pd.DataFrame(
+                            columns=[
+                                "open", "high", "low", "close", "volume",
+                                "quote_volume", "taker_buy_base",
+                            ],
+                            index=pd.DatetimeIndex([], tz="UTC", name="open_time"),
                         )
 
-                    self.d[c] = pd.concat(parts).drop_duplicates()
-
                 else:
-                    df = self._fetch(
-                        sym,
-                        int(self.d[c].index[-1].timestamp() * 1000) + 1,
+                    start = int(self.d[c].index[-1].timestamp() * 1000) + self.interval_ms
+                    request_started = time.perf_counter()
+                    df = self._fetch(sym, start, limit=min(1000, self.warm))
+                    latency = time.perf_counter() - request_started
+                    symbol_requests += 1
+                    total_requests += 1
+                    log.info(
+                        "feed batch symbol=%s batch=1/1 rows=%d latency=%.3fs",
+                        sym, len(df), latency,
                     )
 
                     self.d[c] = (
@@ -139,11 +255,24 @@ class Feed:
                     <= now - pd.Timedelta(minutes=5)
                 ]
 
+                log.info(
+                    "feed symbol %d/%d complete: %s rows=%d requests=%d elapsed=%.2fs",
+                    symbol_index, len(self.coins), sym, len(self.d[c]),
+                    symbol_requests, time.perf_counter() - symbol_started,
+                )
             except Exception as e:
-                log.warning("feed skip %s: %s", c, e)
+                log.error(
+                    "feed failed for symbol %d/%d %s after %d requests: %s",
+                    symbol_index, len(self.coins), sym, symbol_requests, e,
+                    exc_info=True,
+                )
 
                 if c in self.d and len(self.d[c]) == 0:
                     self.d.pop(c)
+        log.info(
+            "feed update complete: symbols=%d requests=%d elapsed=%.2fs",
+            len(self.coins), total_requests, time.perf_counter() - update_started,
+        )
 
 
 class Bot:
@@ -153,7 +282,8 @@ class Bot:
         dry_run=True,
         state_path="state/ledger.json",
     ):
-        self.cfg = yaml.safe_load(open(cfg_path))
+        self.cfg_path = Path(cfg_path)
+        self.cfg = yaml.safe_load(self.cfg_path.read_text(encoding="utf-8"))
         self.dry = dry_run
 
         self.api = RoostooClient()
@@ -249,9 +379,17 @@ class Bot:
         # automatically added to the tradable strategy universe.
         self.feed = Feed(list(dict.fromkeys(self.coins + ["BTC"])))
         self.freq = FREQ_MINUTES[self.cfg["timeframe"]]
+        self._held_quantities: dict[str, float] = {}
+        self._wallet_free_quantities: dict[str, float] = {}
+        self._valuation_complete = True
+        self._entry_freeze_reasons: list[str] = []
 
     def save(self):
-        """Persist state atomically so an interrupted write cannot truncate the ledger."""
+        """Persist state atomically; dry runs must never write the ledger."""
+        if self.dry:
+            log.info("DRY_RUN_STATE_WRITE_BLOCKED path=%s", self.state_path)
+            return
+
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.state_path.with_suffix(
             self.state_path.suffix + ".tmp"
@@ -282,6 +420,11 @@ class Bot:
             d.index.max()
             for d in good.values()
         )
+        staleness = pd.Timestamp.now(tz="UTC") - newest
+        if staleness > pd.Timedelta(minutes=self.freq + 10):
+            raise RuntimeError(
+                f"market feed is stale by {staleness}; refusing to generate live signals"
+            )
 
         good = {
             c: d
@@ -373,17 +516,31 @@ class Bot:
             )
 
     def cycle(self):
+        if getattr(self, "_instance_lock_held", False):
+            return self._cycle()
+        lock_path = self.state_path.with_suffix(".lock")
+        with InstanceLock(lock_path):
+            return self._cycle()
+
+    def _cycle(self):
         # Re-read config every cycle so the kill switch remains effective.
-        cfgl = yaml.safe_load(
-            open("config/live.yaml")
-        )
+        cfgl = yaml.safe_load(self.cfg_path.read_text(encoding="utf-8"))
+        self.cfg = cfgl
 
         mode = cfgl.get("mode", "run")
+        reconciliation_policy = (
+            cfgl.get("position_reconciliation") or {}
+        ).get("unknown_basis_policy", "manual_reconciliation_freeze_entries")
+        if reconciliation_policy != "manual_reconciliation_freeze_entries":
+            raise ValueError(
+                "unsupported position reconciliation policy: "
+                f"{reconciliation_policy!r}"
+            )
         start = cfgl.get("start_utc")
 
         if (
             start
-            and pd.Timestamp.utcnow()
+            and pd.Timestamp.now(tz="UTC")
             < pd.Timestamp(str(start), tz="UTC")
         ):
             log.info(
@@ -399,12 +556,23 @@ class Bot:
 
         # An unresolved submission blocks ALL order paths, including
         # the separate equity-liquidation path, until reconciliation.
-        if not self.dry and self.state.get("pending_order"):
-            log.critical(
-                "TRADING HALTED: unresolved order requires exchange reconciliation: %s",
-                self.state["pending_order"],
-            )
-            return
+        if self.state.get("pending_order"):
+            if self.dry:
+                log.critical(
+                    "DRY-RUN HALTED: persisted pending order requires exchange reconciliation; "
+                    "no simulated orders will be generated"
+                )
+                return
+            self._recover_pending_order()
+            if self.state.get("pending_order"):
+                log.critical(
+                    "TRADING HALTED: unresolved order requires exchange reconciliation: %s",
+                    self.state.get("pending_order"),
+                )
+                return
+            log.warning("previous pending order reconciled; refreshing balances before this cycle")
+            tick = self.api.ticker()
+            wallet = self.api.balance()
 
         self._liquidate_equities(wallet, tick)
 
@@ -414,80 +582,115 @@ class Bot:
             wallet = self.api.balance()
             tick = self.api.ticker()
 
-        tgt = self.signals()
-
-        self.state["pool_cash"]["crypto"] = float(
-            wallet.get("USD", {}).get("Free", 0)
-        )
+        self.state.setdefault("pool_cash", {"crypto": 0.0, "equity": 0.0})
+        cash_free = _finite_float(wallet.get("USD", {}).get("Free"))
+        cash_locked = _finite_float(wallet.get("USD", {}).get("Lock"))
+        crypto_weight = _finite_float(cfgl.get("crypto_weight"), -1)
+        if not 0 <= crypto_weight <= 1:
+            raise ValueError("config crypto_weight must be between 0 and 1")
+        self.state["pool_cash"]["crypto"] = cash_free * crypto_weight
+        self.state["pool_cash"]["equity"] = cash_free * (1.0 - crypto_weight)
 
         fee = TAKER_FEE
         exit_cfg = cfgl.get("position_exits") or {}
         position_exits_enabled = bool(exit_cfg.get("enabled", False))
         x18_cfg = cfgl.get("x18") or {}
         x18_enabled = bool(x18_cfg.get("enabled", False))
-
-        def _qv(c, v):
-            q = v["Free"] + v["Lock"]
-
-            px = float(
-                tick.get(
-                    f"{c}/USD",
-                    {},
-                ).get("LastPrice")
-                or 0
-            )
-
-            return (
-                q > 0
-                and (
-                    px == 0
-                    or q * px >= 5.0
-                )
-            )
-
-        # IMPORTANT:
-        # Only classify and manage assets whose Roostoo
-        # AssetType is explicitly crypto.
         crypto_coins = {
-            p["Coin"]
-            for p in self.pairs.values()
-            if p.get("AssetType") == "crypto"
+            pair.rsplit("/", 1)[0]
+            for pair, pair_info in self.pairs.items()
+            if "/" in pair and pair_info.get("AssetType") == "crypto"
         }
-
-        # Existing equity positions are deliberately excluded.
-        held = {
-            c: v["Free"] + v["Lock"]
-            for c, v in wallet.items()
-            if (
-                c != "USD"
-                and c in crypto_coins
-                and _qv(c, v)
+        reconciliation_required = self.state.setdefault(
+            "reconciliation_required", {}
+        )
+        entries = self.state.setdefault("entries", {})
+        held, unresolved = reconcile_crypto_holdings(
+            wallet,
+            self.pairs,
+            entries,
+            reconciliation_required,
+        )
+        self._held_quantities = held
+        self._wallet_free_quantities = {
+            coin: float(balance.get("Free", 0) or 0)
+            for coin, balance in wallet.items()
+            if coin != "USD"
+        }
+        self._entry_freeze_reasons = []
+        if unresolved:
+            self._entry_freeze_reasons.append("unreconciled exchange holdings")
+            log.critical(
+                "ENTRY FREEZE: exchange holdings require manual reconciliation: %s",
+                ", ".join(sorted(unresolved)),
             )
-        }
+
+        for coin in held:
+            meta = entries.get(coin, {})
+            if not (meta.get("entry_signal_bar_ts") or meta.get("entry_ts")):
+                marker = reconciliation_required.setdefault(
+                    coin,
+                    {
+                        "reason": "missing_entry_timestamp",
+                        "first_detected_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    },
+                )
+                marker["observed_quantity"] = held[coin]
+                if coin not in self._entry_freeze_reasons:
+                    self._entry_freeze_reasons.append("missing entry timestamps")
+                log.critical(
+                    "POSITION REQUIRES RECONCILIATION: %s has no verified entry timestamp; "
+                    "X18 time exit is unavailable",
+                    coin,
+                )
+
+        if reconciliation_required and not self._entry_freeze_reasons:
+            self._entry_freeze_reasons.append("unreconciled exchange holdings")
 
         def _px(c):
-            t = tick.get(
-                f"{c}/USD",
-                {},
-            )
+            ticker = tick.get(f"{c}/USD", {})
+            for key in ("LastPrice", "MaxBid", "MinAsk"):
+                try:
+                    value = float(ticker.get(key) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    return value
+            return 0.0
 
-            return float(
-                t.get("LastPrice")
-                or t.get("MaxBid")
-                or t.get("MinAsk")
-                or 0
+        self._valuation_complete = True
+        unpriced_assets = []
+        for coin, value in wallet.items():
+            if coin == "USD":
+                continue
+            qty = float(value.get("Free", 0) or 0) + float(value.get("Lock", 0) or 0)
+            if qty > 0 and _px(coin) <= 0:
+                self._valuation_complete = False
+                unpriced_assets.append(coin)
+        if unpriced_assets:
+            self._entry_freeze_reasons.append("wallet contains unpriced assets")
+            log.critical(
+                "EQUITY VALUATION INCOMPLETE; entries frozen until ticker prices are available: %s",
+                ", ".join(sorted(unpriced_assets)),
             )
 
         usd = wallet.get("USD", {})
 
         eq = (
-            usd.get("Free", 0)
-            + usd.get("Lock", 0)
+            cash_free
+            + cash_locked
             + sum(
-                (v["Free"] + v["Lock"]) * _px(c)
+                (float(v.get("Free", 0) or 0) + float(v.get("Lock", 0) or 0)) * _px(c)
                 for c, v in wallet.items()
-                if c != "USD"
+                if c != "USD" and _px(c) > 0
             )
+        )
+        log.info(
+            "wallet reconciliation: USD free=%.2f locked=%.2f crypto_pool=%.2f "
+            "equity_pool=%.2f crypto_holdings=%d valuation_complete=%s equity=%.2f",
+            cash_free, cash_locked, self.state["pool_cash"]["crypto"],
+            self.state["pool_cash"]["equity"], len(held),
+            self._valuation_complete, eq,
         )
 
         peak = update_peak_equity(self.state, eq)
@@ -501,7 +704,7 @@ class Bot:
             else 0.0
         )
 
-        mult = 1.0
+        mult = 1.0 if self._valuation_complete else 0.0
 
         for th, m in sorted(
             cfgl.get("dd_ladder", []) or []
@@ -517,7 +720,6 @@ class Bot:
         }
 
         # Update per-position excursions before any exit order is considered.
-        entries = self.state.setdefault("entries", {})
         for coin, qty in held.items():
             meta = entries.get(coin)
             px = _px(coin)
@@ -533,6 +735,42 @@ class Bot:
         if not self.dry:
             self.save()
 
+        for coin in held:
+            pair = f"{coin}/USD"
+            ticker = tick.get(pair, {})
+            executable_bid = _finite_float(ticker.get("MaxBid"))
+            if executable_bid <= 0:
+                reconciliation_required.setdefault(
+                    coin,
+                    {
+                        "reason": "ticker_pair_missing" if pair not in tick else "missing_executable_bid",
+                        "first_detected_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    },
+                )
+                if "missing executable bid" not in self._entry_freeze_reasons:
+                    self._entry_freeze_reasons.append("missing executable bid")
+                log.critical(
+                    "POSITION REQUIRES RECONCILIATION: %s has no executable MaxBid "
+                    "(ticker_pair_present=%s); no automatic sale will be attempted",
+                    coin, pair in tick,
+                )
+
+        if reconciliation_required and not self._entry_freeze_reasons:
+            self._entry_freeze_reasons.append("unreconciled exchange holdings")
+
+        if not self.dry:
+            self.save()
+
+        self.current_signal_bar = None
+        try:
+            tgt = self.signals()
+        except Exception:
+            log.exception(
+                "signal/feed unavailable; X18 hard stops remain active, time exits and new entries are disabled"
+            )
+            tgt = pd.Series(dtype=float)
+            self._entry_freeze_reasons.append("signal/feed unavailable")
+
         # X18 has priority when explicitly enabled; legacy research exits remain
         # available only when X18 is disabled.
         exit_reasons = {}
@@ -540,24 +778,42 @@ class Bot:
             current_bar = getattr(self, "current_signal_bar", None)
             for coin, qty in held.items():
                 meta = entries.get(coin, {})
-                entry_px = float(meta.get("entry_price") or 0)
+                entry_px = _finite_float(meta.get("entry_price"))
                 pair = f"{coin}/USD"
-                sell_px = float(
-                    tick.get(pair, {}).get("MaxBid")
-                    or 0
-                )
-                if entry_px <= 0 or sell_px <= 0:
-                    log.warning(
-                        "X18 skipped for %s: missing entry cost basis or executable bid",
+                sell_px = _finite_float(tick.get(pair, {}).get("MaxBid"))
+                if entry_px <= 0:
+                    log.critical(
+                        "X18 REQUIRES MANUAL RECONCILIATION for %s: verified entry cost basis is absent; "
+                        "position retained and new entries frozen",
                         coin,
                     )
                     continue
+                if sell_px <= 0:
+                    log.critical(
+                        "X18 REQUIRES MANUAL RECONCILIATION for %s: executable MaxBid is unavailable; "
+                        "position retained and new entries frozen",
+                        coin,
+                    )
+                    continue
+                if not (meta.get("entry_signal_bar_ts") or meta.get("entry_ts")) or current_bar is None:
+                    log.critical(
+                        "X18 time exit unavailable for %s: verified entry/current completed-bar timestamp missing; "
+                        "hard-stop evaluation remains active",
+                        coin,
+                    )
 
                 bars_held = completed_bars_held(
                     meta.get("entry_signal_bar_ts") or meta.get("entry_ts"),
                     current_bar,
                     self.freq,
                 )
+                if bars_held is None:
+                    self._entry_freeze_reasons.append("X18 hold age unavailable")
+                    log.critical(
+                        "X18 TIME EXIT UNAVAILABLE for %s: timestamps are missing, invalid, "
+                        "future-dated, or no completed signal bar is available; hard stop remains active",
+                        coin,
+                    )
                 reason = x18_exit_reason(
                     entry_price=entry_px,
                     sell_price=sell_px,
@@ -580,17 +836,14 @@ class Bot:
         elif position_exits_enabled:
             for coin, qty in held.items():
                 meta = entries.get(coin, {})
-                entry_px = float(meta.get("entry_price") or 0)
-                peak_px = float(meta.get("peak_price_since_entry") or 0)
+                entry_px = _finite_float(meta.get("entry_price"))
+                peak_px = _finite_float(meta.get("peak_price_since_entry"))
                 pair = f"{coin}/USD"
-                sell_px = float(
-                    tick.get(pair, {}).get("MaxBid")
-                    or _px(coin)
-                    or 0
-                )
+                sell_px = _finite_float(tick.get(pair, {}).get("MaxBid"))
                 if entry_px <= 0 or peak_px <= 0 or sell_px <= 0:
-                    log.warning(
-                        "position exit rules skipped for %s: missing entry/peak/price metadata",
+                    log.critical(
+                        "POSITION EXIT REQUIRES RECONCILIATION for %s: "
+                        "verified entry/peak or executable bid is unavailable",
                         coin,
                     )
                     continue
@@ -633,10 +886,23 @@ class Bot:
 
         # ---------------------------------------------------------
         # EXITS
-        # Only crypto positions can be exited by this bot.
-        # Existing equity positions are completely ignored.
+        # Never liquidate a legacy/orphan holding using an invented basis.
         # ---------------------------------------------------------
         for coin, qty in held.items():
+            if coin in reconciliation_required:
+                marker = reconciliation_required[coin]
+                reason = marker.get("reason") if isinstance(marker, dict) else None
+                if reason == "missing_entry_timestamp" and _finite_float(
+                    entries.get(coin, {}).get("entry_price")
+                ) > 0:
+                    pass
+                else:
+                    log.critical(
+                        "MANUAL POSITION RECONCILIATION REQUIRED: retaining %s quantity=%s; "
+                        "automatic exit is disabled until basis/market data are verified",
+                        coin, held[coin],
+                    )
+                    continue
             triggered_reason = exit_reasons.get(coin)
             if triggered_reason or should_exit_held(coin, tgt, mode):
                 pair = f"{coin}/USD"
@@ -680,6 +946,13 @@ class Bot:
         if mode != "run":
             return
 
+        if self._entry_freeze_reasons:
+            log.critical(
+                "NEW ENTRIES BLOCKED: %s",
+                "; ".join(sorted(set(self._entry_freeze_reasons))),
+            )
+            return
+
         # Entries.
         if mult <= 0:
             log.info(
@@ -697,7 +970,7 @@ class Bot:
         )
 
         cooldowns = self.state.setdefault("exit_cooldowns", {})
-        cooldown_now = pd.Timestamp.utcnow()
+        cooldown_now = pd.Timestamp.now(tz="UTC")
 
         def _cooldown_active(coin):
             if x18_enabled:
@@ -760,12 +1033,24 @@ class Bot:
                 break
 
             pair = f"{coin}/USD"
-            pi = self.pairs[pair]
+            pi = self.pairs.get(pair)
+            ask = _finite_float(tick.get(pair, {}).get("MinAsk"))
+            if (
+                not pi
+                or pi.get("AssetType") != "crypto"
+                or pi.get("CanTrade") is False
+                or ask <= 0
+            ):
+                log.error(
+                    "ENTRY SKIPPED %s: pair is unsupported, non-tradable, or lacks a valid MinAsk",
+                    pair,
+                )
+                continue
 
             q = plan_entry(
                 self.state["pool_cash"]["crypto"],
                 self.cfg["pos_frac"] * mult,
-                tick[pair]["MinAsk"],
+                ask,
                 pi["AmountPrecision"],
                 pi["MiniOrder"],
                 fee,
@@ -812,6 +1097,238 @@ class Bot:
 
         return out
 
+    @staticmethod
+    def _order_detail(response):
+        if not isinstance(response, dict):
+            raise TypeError("Order response is not a dictionary")
+        if isinstance(response.get("OrderDetail"), dict):
+            return response["OrderDetail"]
+        data = response.get("Data")
+        if isinstance(data, dict) and isinstance(data.get("OrderDetail"), dict):
+            return data["OrderDetail"]
+        if "Status" in response:
+            return response
+        raise ValueError("Order response does not contain a recognized order detail")
+
+    def _record_order_update(self, response) -> bool:
+        pending = self.state.get("pending_order")
+        if not isinstance(pending, dict):
+            raise RuntimeError("Cannot record an order update without a pending order")
+        previous_response = pending.get("response")
+        detail = self._order_detail(response)
+        status = str(detail.get("Status") or "").upper()
+        pending["order_id"] = detail.get("OrderID", pending.get("order_id"))
+        pending["exchange_status"] = status or None
+        pending["response"] = response
+
+        try:
+            filled_qty = float(detail.get("FilledQuantity") or 0)
+            fill_price = float(detail.get("FilledAverPrice") or 0)
+            if filled_qty > 0 and "CommissionChargeValue" not in detail:
+                raise ValueError("filled order response is missing CommissionChargeValue")
+            if filled_qty > 0 and detail.get("CommissionChargeValue") is None:
+                raise ValueError("filled order response has an empty CommissionChargeValue")
+            cumulative_fee = float(detail.get("CommissionChargeValue") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Malformed order fill values: {exc}") from exc
+
+        if (
+            not math.isfinite(filled_qty)
+            or not math.isfinite(fill_price)
+            or not math.isfinite(cumulative_fee)
+            or filled_qty < 0
+            or cumulative_fee < 0
+            or (filled_qty > 0 and fill_price <= 0)
+        ):
+            raise ValueError("Order response contains invalid cumulative fill values")
+
+        legacy_accounted_fills = False
+        if "accounted_filled_quantity" in pending:
+            accounted_qty = _finite_float(pending["accounted_filled_quantity"], -1)
+            accounted_notional = _finite_float(pending.get("accounted_notional", 0), -1)
+            accounted_fee = _finite_float(pending.get("accounted_fee", 0), -1)
+        elif "filled_quantity" in pending:
+            # Older ledger versions applied this response's cumulative fill
+            # before persisting these fields.
+            legacy_accounted_fills = True
+            accounted_qty = _finite_float(pending["filled_quantity"], -1)
+            accounted_notional = accounted_qty * _finite_float(
+                pending.get("average_fill_price")
+            )
+            prior_response = previous_response
+            if isinstance(prior_response, dict):
+                try:
+                    prior_detail = self._order_detail(prior_response)
+                    accounted_fee = _finite_float(
+                        prior_detail.get("CommissionChargeValue"),
+                        cumulative_fee,
+                    )
+                except (TypeError, ValueError):
+                    accounted_fee = cumulative_fee
+            else:
+                accounted_fee = cumulative_fee
+        else:
+            accounted_qty = accounted_notional = accounted_fee = 0.0
+
+        if min(accounted_qty, accounted_notional, accounted_fee) < 0:
+            raise ValueError("Persisted pending-order fill accounting is invalid")
+        if filled_qty + 1e-12 < accounted_qty or cumulative_fee + 1e-12 < accounted_fee:
+            raise ValueError("Exchange cumulative fill values moved backwards")
+        cumulative_notional = filled_qty * fill_price
+        if not math.isfinite(cumulative_notional):
+            raise ValueError("Order fill notional is not finite")
+        delta_qty = filled_qty - accounted_qty
+        delta_notional = cumulative_notional - accounted_notional
+        delta_fee = cumulative_fee - accounted_fee
+        if delta_notional < -max(1e-8, accounted_notional * 1e-10):
+            raise ValueError("Exchange cumulative fill notional moved backwards")
+
+        side = str(pending["side"]).upper()
+        coin = str(pending["symbol"]).split("/", 1)[0]
+        if delta_qty > 1e-12 or abs(delta_notional) > 1e-8 or delta_fee > 1e-12:
+            pool_cash = self.state.setdefault("pool_cash", {})
+            pool_cash.setdefault("crypto", 0.0)
+            if side == "BUY":
+                entries = self.state.setdefault("entries", {})
+                meta = entries.get(coin)
+                if not isinstance(meta, dict) or _finite_float(meta.get("entry_price")) <= 0:
+                    meta = {}
+                    entries[coin] = meta
+                old_qty = _finite_float(meta.get("remaining_quantity"))
+                if legacy_accounted_fills and "remaining_quantity" not in meta:
+                    old_qty = accounted_qty
+                old_price = _finite_float(meta.get("entry_price"))
+                new_qty = old_qty + delta_qty
+                if new_qty > 0:
+                    new_cost = old_qty * old_price + delta_notional
+                    new_price = new_cost / new_qty
+                    if not math.isfinite(new_price) or new_price <= 0:
+                        raise ValueError("Unable to derive a positive average entry cost from confirmed fills")
+                    pool_cash["crypto"] -= delta_notional + delta_fee
+                    meta.update(
+                        {
+                            "entry_price": new_price,
+                            "remaining_quantity": new_qty,
+                            "entry_quantity": _finite_float(
+                                meta.get("entry_quantity"), old_qty
+                            ) + delta_qty,
+                            "entry_ts": meta.get("entry_ts") or pd.Timestamp.now(tz="UTC").isoformat(),
+                            "entry_signal_bar_ts": (
+                                meta.get("entry_signal_bar_ts")
+                                or (
+                                    pd.Timestamp(self.current_signal_bar).isoformat()
+                                    if getattr(self, "current_signal_bar", None) is not None
+                                    else None
+                                )
+                            ),
+                            "peak_price_since_entry": max(
+                                float(meta.get("peak_price_since_entry", 0) or 0),
+                                fill_price,
+                            ),
+                            "trough_price_since_entry": min(
+                                float(meta.get("trough_price_since_entry") or fill_price),
+                                fill_price,
+                            ),
+                        }
+                    )
+                    meta.setdefault("mfe", 0.0)
+                    meta.setdefault("mae", 0.0)
+                    self.state.setdefault("reconciliation_required", {}).pop(coin, None)
+                    held_qtys = getattr(self, "_held_quantities", None)
+                    if held_qtys is None:
+                        held_qtys = self._held_quantities = {}
+                    held_qtys[coin] = _finite_float(held_qtys.get(coin)) + delta_qty
+                    free_qtys = getattr(self, "_wallet_free_quantities", None)
+                    if free_qtys is not None:
+                        free_qtys[coin] = _finite_float(free_qtys.get(coin)) + delta_qty
+            elif side == "SELL":
+                pool_cash["crypto"] += delta_notional - delta_fee
+                meta = self.state.setdefault("entries", {}).get(coin)
+                if isinstance(meta, dict):
+                    remaining = max(
+                        0.0,
+                        _finite_float(meta.get("remaining_quantity")) - delta_qty,
+                    )
+                    meta["remaining_quantity"] = remaining
+                    if remaining == 0:
+                        self.state["entries"].pop(coin, None)
+                held_qtys = getattr(self, "_held_quantities", None)
+                if held_qtys is not None:
+                    held_qtys[coin] = max(
+                        0.0,
+                        _finite_float(held_qtys.get(coin)) - delta_qty,
+                    )
+                free_qtys = getattr(self, "_wallet_free_quantities", None)
+                if free_qtys is not None:
+                    free_qtys[coin] = max(
+                        0.0,
+                        _finite_float(free_qtys.get(coin)) - delta_qty,
+                    )
+                else:
+                    self.state.setdefault("reconciliation_required", {})[coin] = {
+                        "reason": "confirmed_sell_fill_without_entry_metadata",
+                        "observed_quantity": None,
+                        "first_detected_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    }
+            else:
+                raise ValueError(f"Unsupported pending order side: {side}")
+
+        pending["accounted_filled_quantity"] = filled_qty
+        pending["accounted_notional"] = cumulative_notional
+        pending["accounted_fee"] = cumulative_fee
+        pending["filled_quantity"] = filled_qty
+        pending["average_fill_price"] = fill_price
+        self.save()
+
+        requested_qty = float(pending["quantity"])
+        fill_tolerance = max(1e-12, requested_qty * 1e-8)
+        fully_filled = status == "FILLED" and filled_qty + fill_tolerance >= requested_qty
+        overfilled = filled_qty > requested_qty + fill_tolerance
+        terminal_statuses = {"FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}
+        if status in terminal_statuses and not overfilled and not (
+            status == "FILLED" and not fully_filled
+        ):
+            self.state.pop("pending_order", None)
+            self.save()
+            if filled_qty:
+                log.info(
+                    "order terminal status=%s symbol=%s cumulative_fill=%s @ %s fee=%s",
+                    status, pending["symbol"], filled_qty, fill_price, cumulative_fee,
+                )
+            else:
+                log.warning("order terminal without fill status=%s symbol=%s", status, pending["symbol"])
+            return fully_filled or (side == "BUY" and filled_qty > 0)
+
+        pending["status"] = "partial_fill" if filled_qty > 0 else "reconciliation_required"
+        self.save()
+        log.critical(
+            "ORDER NOT CONFIRMED COMPLETE: %s status=%s requested=%s filled=%s; "
+            "submission remains journaled and new orders are blocked",
+            pending["symbol"], status or "UNKNOWN", requested_qty, filled_qty,
+        )
+        return False
+
+    def _recover_pending_order(self) -> bool:
+        pending = self.state.get("pending_order")
+        if not isinstance(pending, dict):
+            return True
+        order_id = pending.get("order_id")
+        if not order_id:
+            log.critical(
+                "PENDING ORDER REQUIRES MANUAL RECONCILIATION: exchange order id is unknown; "
+                "no retry will be submitted",
+            )
+            return False
+        try:
+            response = self.api.query_order(order_id=str(order_id))
+            return self._record_order_update(response)
+        except Exception:
+            log.exception(
+                "PENDING ORDER RECONCILIATION FAILED for order_id=%s; trading remains blocked",
+                order_id,
+            )
+            return False
+
     def _order(
         self,
         coin,
@@ -828,6 +1345,7 @@ class Bot:
         if (
             pair_info is None
             or pair_info.get("AssetType") != "crypto"
+            or not pair_info.get("CanTrade")
         ):
             log.warning(
                 "BLOCKED non-crypto order: %s %s",
@@ -837,9 +1355,80 @@ class Bot:
             return False
 
         pair = f"{coin}/USD"
+        side = str(side).upper()
 
-        if qty <= 0:
+        if side not in {"BUY", "SELL"}:
             return False
+        try:
+            qty = float(qty)
+            precision = int(pair_info.get("AmountPrecision", 8))
+            normalized_qty = floor_qty(qty, precision)
+            minimum_order = _finite_float(pair_info.get("MiniOrder", 0), -1)
+        except (TypeError, ValueError, OverflowError):
+            log.error("BLOCKED order with invalid quantity or exchange precision: %s %s", side, pair)
+            return False
+        if not math.isfinite(qty) or qty <= 0 or precision < 0 or precision > 10 or minimum_order < 0:
+            log.error("BLOCKED order with invalid exchange constraints: %s %s", side, pair)
+            return False
+        if not math.isfinite(qty) or normalized_qty <= 0 or abs(qty - normalized_qty) > max(1e-12, qty * 1e-10):
+            log.error(
+                "BLOCKED order quantity violates exchange precision: %s %s qty=%s precision=%s",
+                side, pair, qty, precision,
+            )
+            return False
+
+        ticker = tick.get(pair, {})
+        price_field = "MinAsk" if side == "BUY" else "MaxBid"
+        try:
+            reference_price = float(ticker.get(price_field) or 0)
+        except (TypeError, ValueError):
+            reference_price = 0.0
+        if not math.isfinite(reference_price) or reference_price <= 0:
+            log.critical(
+                "BLOCKED %s %s: executable reference %s is unavailable",
+                side, pair, price_field,
+            )
+            return False
+        notional = qty * reference_price
+        if notional < minimum_order:
+            log.error(
+                "BLOCKED order below exchange minimum: %s %s notional=%.8f minimum=%.8f",
+                side, pair, notional, minimum_order,
+            )
+            return False
+
+        if side == "SELL":
+            free_qty = getattr(self, "_wallet_free_quantities", {}).get(coin)
+            if free_qty is not None and qty > free_qty + max(1e-12, free_qty * 1e-10):
+                log.error(
+                    "BLOCKED sell exceeds exchange free balance: %s requested=%s free=%s",
+                    pair, qty, free_qty,
+                )
+                return False
+        else:
+            if self._held_quantities.get(coin, 0) > 0:
+                log.error("BLOCKED duplicate entry for already-held asset %s", pair)
+                return False
+            cash = _finite_float(self.state.get("pool_cash", {}).get("crypto", 0))
+            configured_fraction = _finite_float(
+                getattr(self, "cfg", {}).get("pos_frac", 1.0), -1
+            )
+            multiplier = _finite_float(
+                getattr(self, "order_context", {}).get("dd_multiplier"), 1.0
+            )
+            if not 0 <= configured_fraction <= 1 or multiplier < 0:
+                log.error("BLOCKED buy due to invalid configured sizing/risk multiplier")
+                return False
+            cash_limit = min(
+                max(0.0, cash / (1.0 + TAKER_FEE)),
+                max(0.0, cash * configured_fraction * multiplier),
+            )
+            if notional > cash_limit + max(1e-8, cash_limit * 1e-10):
+                log.error(
+                    "BLOCKED buy exceeds available allocation: %s notional=%.8f limit=%.8f cash=%.8f",
+                    pair, notional, cash_limit, cash,
+                )
+                return False
 
         # Fail closed if a previous live order has not been reconciled.
         if not self.dry and self.state.get("pending_order"):
@@ -881,6 +1470,31 @@ class Bot:
         )
 
         if self.dry:
+            if side == "BUY":
+                self.state["pool_cash"]["crypto"] = max(
+                    0.0,
+                    _finite_float(self.state.get("pool_cash", {}).get("crypto"))
+                    - notional * (1.0 + TAKER_FEE),
+                )
+                self._held_quantities[coin] = (
+                    self._held_quantities.get(coin, 0.0) + qty
+                )
+                if coin in self._wallet_free_quantities:
+                    self._wallet_free_quantities[coin] += qty
+            else:
+                self.state["pool_cash"]["crypto"] = (
+                    _finite_float(self.state.get("pool_cash", {}).get("crypto"))
+                    + notional * (1.0 - TAKER_FEE)
+                )
+                self._held_quantities[coin] = max(
+                    0.0,
+                    self._held_quantities.get(coin, 0.0) - qty,
+                )
+                if coin in self._wallet_free_quantities:
+                    self._wallet_free_quantities[coin] = max(
+                        0.0,
+                        self._wallet_free_quantities[coin] - qty,
+                    )
             log.info(
                 "[dry-run] %s %s %s",
                 side,
@@ -920,20 +1534,8 @@ class Bot:
             return False
 
         try:
-            if not isinstance(d, dict):
-                raise TypeError("Order response is not a dictionary")
-
-            order_status = str(d.get("Status") or "").upper()
-            pending = self.state["pending_order"]
-            pending["order_id"] = d.get("OrderID")
-            pending["exchange_status"] = order_status or None
-            pending["response"] = d
-            self.save()
-
-            filled_qty = float(d.get("FilledQuantity") or 0)
-            fill_px = float(d.get("FilledAverPrice") or 0)
-            fee = float(d.get("CommissionChargeValue") or 0)
-        except (AttributeError, TypeError, ValueError) as e:
+            return self._record_order_update(d)
+        except (AttributeError, TypeError, ValueError, RuntimeError) as e:
             self.state["pending_order"]["status"] = "uncertain"
             self.state["pending_order"]["error"] = (
                 "Malformed order response: " + repr(e)
@@ -945,109 +1547,34 @@ class Bot:
             )
             return False
 
-        if filled_qty <= 0 or fill_px <= 0:
-            self.state["pending_order"]["status"] = "uncertain"
-            self.state["pending_order"]["response"] = d
-            self.save()
-            log.error(
-                "ORDER UNCERTAIN %s %s: no valid fill; trading is blocked",
-                side, pair,
-            )
-            return False
-
-        notional = filled_qty * fill_px
-        self.state["pool_cash"]["crypto"] += (
-            (notional - fee)
-            if side == "SELL"
-            else -(notional + fee)
-        )
-
-        if side == "BUY":
-            self.state.setdefault("entries", {})[coin] = {
-                "entry_price": fill_px,
-                "entry_ts": pd.Timestamp.now(tz="UTC").isoformat(),
-                "entry_signal_bar_ts": (
-                    pd.Timestamp(getattr(self, "current_signal_bar")).isoformat()
-                    if getattr(self, "current_signal_bar", None) is not None
-                    else None
-                ),
-                "peak_price_since_entry": fill_px,
-                "trough_price_since_entry": fill_px,
-                "mfe": 0.0,
-                "mae": 0.0,
-            }
-        elif side == "SELL":
-            # Do not discard cost-basis / peak metadata on a partial fill.
-            # The next wallet snapshot remains the source of truth for residual qty.
-            if filled_qty + max(1e-12, float(qty) * 1e-8) >= float(qty):
-                self.state.setdefault("entries", {}).pop(coin, None)
-            else:
-                log.warning(
-                    "partial SELL fill for %s: requested=%s filled=%s; retaining position metadata",
-                    pair, qty, filled_qty,
-                )
-
-        # A quantity alone does not prove the exchange order is finished.
-        # Clear only for a confirmed FILLED status and full requested quantity.
-        fill_tolerance = max(1e-12, float(qty) * 1e-8)
-        fully_filled = (
-            order_status == "FILLED"
-            and filled_qty + fill_tolerance >= float(qty)
-        )
-        if not fully_filled:
-            pending = self.state["pending_order"]
-            pending["status"] = (
-                "partial_fill"
-                if filled_qty + fill_tolerance < float(qty)
-                else "reconciliation_required"
-            )
-            pending["filled_quantity"] = filled_qty
-            pending["average_fill_price"] = fill_px
-            self.save()
-            log.critical(
-                "ORDER NOT CONFIRMED COMPLETE: %s status=%s "
-                "requested=%s filled=%s; trading remains blocked",
-                pair, order_status or "UNKNOWN", qty, filled_qty,
-            )
-            return False
-
-        # Clear only after a confirmed full fill has been recorded and saved.
-        self.state.pop("pending_order", None)
-        self.save()
-
-        log.info(
-            "filled %s %s %s @ %s fee=%s",
-            side,
-            d.get("FilledQuantity"),
-            pair,
-            d.get("FilledAverPrice"),
-            fee,
-        )
-
-        return True
-
     def run(self):
-        while True:
-            t0 = time.time()
-
+        lock_path = self.state_path.with_suffix(".lock")
+        with InstanceLock(lock_path):
+            self._instance_lock_held = True
+            if self.state_path.exists():
+                self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
+                self.state.setdefault("entries", {})
+                self.state.setdefault("pool_cash", {"crypto": 0.0, "equity": 0.0})
+            log.info("single bot instance lock acquired: %s", lock_path)
             try:
-                self.cycle()
-            except Exception:
-                log.exception(
-                    "cycle failed - holding"
-                )
+                while True:
+                    try:
+                        self.cycle()
+                    except Exception:
+                        log.exception("cycle failed - holding")
 
-            step = self.freq * 60
-
-            time.sleep(
-                max(
-                    5,
-                    (
-                        int(time.time()) // step
-                        + 1
+                    step = self.freq * 60
+                    time.sleep(
+                        max(
+                            5,
+                            (
+                                int(time.time()) // step
+                                + 1
+                            )
+                            * step
+                            + 15
+                            - time.time(),
+                        )
                     )
-                    * step
-                    + 15
-                    - time.time(),
-                )
-            )
+            finally:
+                self._instance_lock_held = False

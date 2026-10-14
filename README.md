@@ -1481,8 +1481,8 @@ cp .env.example .env
 
 ```bash
 # 1. Tests
-python -m pytest -q
-# expect: 11 passed
+python -m pytest -q tests
+# Require all tests in the deployed checkout to pass.
 
 # 2. Config check
 python -c "import yaml; print(yaml.safe_load(open('config/live.yaml')))"
@@ -1500,23 +1500,28 @@ python -m rq.cli live --confirm
 
 ### 23.5 Keeping the process alive
 
+Run one persistent bot only. The process holds `state/ledger.lock`; a second
+process using the same ledger is refused rather than running a duplicate cycle.
+The kernel releases this lock when the process exits.
+
 Example using `tmux`:
 
 ```bash
-tmux new -s roostoo
-source .venv/bin/activate
-python -m rq.cli live --confirm
-# detach: Ctrl+B then D
-# reattach: tmux attach -t roostoo
+tmux has-session -t roostoo 2>/dev/null && {
+  echo "roostoo session already exists; inspect it instead of starting another"
+  exit 1
+}
+tmux new-session -d -s roostoo \
+  "cd /opt/roostoo-quant && source .venv/bin/activate && exec python -m rq.cli live --confirm"
+tmux capture-pane -pt roostoo
+# Attach: tmux attach -t roostoo
+# Detach: Ctrl+B, then D
 ```
 
-Example using `nohup`:
-
-```bash
-nohup python -m rq.cli live --confirm > live.log 2>&1 &
-```
-
-<!-- VERIFY: confirm the bot's own log location so the tracker can find it. -->
+To stop the instance, attach and press Ctrl+C; verify it exited before starting
+another session. If the ledger reports a pending order or a position requiring
+reconciliation, resolve it against the exchange before restarting. The process
+lock does not reconcile exchange orders or make legacy cost basis safe to infer.
 
 ### 23.6 Updating a running deployment
 
