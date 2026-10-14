@@ -904,6 +904,7 @@ def test_bot_suppresses_exit_when_exchange_quantity_mismatches_ledger(tmp_path, 
 
 
 def test_dry_run_queries_exchange_history_and_reconciles_four_holdings_without_orders(tmp_path, caplog):
+    caplog.set_level("INFO")
     holdings = {"BTC": 0.08992, "CAKE": 3011.12, "EDEN": 111203.6, "FIL": 5786.78}
     prices = {"BTC": 50000.0, "CAKE": 10.0, "EDEN": 0.2, "FIL": 4.0}
     cfg_path = tmp_path / "live.yaml"
