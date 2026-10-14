@@ -198,25 +198,64 @@ def _finite_positive(value: Any) -> float | None:
     return result if math.isfinite(result) and result > 0 else None
 
 
-def _order_detail(response: Any) -> dict[str, Any] | None:
-    if not isinstance(response, dict) or response.get("Success") is False:
+def _absolute_positive(value: Any) -> float | None:
+    if isinstance(value, bool):
         return None
+    try:
+        result = abs(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) and result > 0 else None
+
+
+def _order_details(response: Any) -> list[dict[str, Any]]:
+    """Normalize place-order and documented query-order response shapes."""
+    if not isinstance(response, dict) or response.get("Success") is False:
+        return []
     detail = response.get("OrderDetail")
     if isinstance(detail, dict):
-        return detail
+        return [detail]
     data = response.get("Data")
     if isinstance(data, dict) and isinstance(data.get("OrderDetail"), dict):
-        return data["OrderDetail"]
+        return [data["OrderDetail"]]
+    matched = response.get("OrderMatched")
+    if isinstance(matched, list):
+        return [item for item in matched if isinstance(item, dict)]
     if "Status" in response:
-        return response
+        return [response]
+    return []
+
+
+def _exchange_timestamp(value: Any) -> str | None:
+    """Parse an exchange timestamp in ISO-8601 or Roostoo epoch milliseconds."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(float(value)) or float(value) <= 0:
+            return None
+        seconds = float(value) / 1000.0 if float(value) > 100_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    return _aware_timestamp(value)
+
+
+def _detail_create_epoch(detail: dict[str, Any]) -> float | None:
+    value = detail.get("CreateTimestamp")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if math.isfinite(numeric) and numeric > 0:
+            return numeric / 1000.0 if numeric > 100_000_000_000 else numeric
     return None
 
 
 def _detail_fill_timestamp(detail: dict[str, Any]) -> str | None:
     for key in ("FilledTime", "LastFilledTime", "TransactTime"):
-        timestamp = _aware_timestamp(detail.get(key))
+        timestamp = _exchange_timestamp(detail.get(key))
         if timestamp is not None:
             return timestamp
+    # FinishTimestamp is a fill time only when the exchange says the order FILLED.
+    if str(detail.get("Status", "")).upper() == "FILLED":
+        return _exchange_timestamp(detail.get("FinishTimestamp"))
     return None
 
 
@@ -228,77 +267,72 @@ def recover_from_execution_journal(
     reconciliation_required: dict[str, Any],
     *,
     account_scope: str | None,
+    additional_events: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Recover positions only when journal fills exactly explain wallet quantity.
-
-    The journal's local observation time is used only to order order records;
-    it is never adopted as an exchange fill/entry timestamp.
-    """
-    if journal_path is None or not account_scope:
+    """Recover positions from account-scoped journal records and exchange history."""
+    if not account_scope:
         return []
-    path = Path(journal_path)
-    if not path.exists():
-        return []
-
     orders: dict[str, dict[str, Any]] = {}
-    with path.open(encoding="utf-8") as journal:
-        for line_number, line in enumerate(journal, 1):
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(
-                    f"invalid execution journal JSON at {path}:{line_number}"
-                ) from exc
-            if not isinstance(event, dict):
-                raise ValueError(
-                    f"invalid execution journal record at {path}:{line_number}"
-                )
-            if event.get("account_scope") != account_scope:
-                continue
-            api_path = event.get("path")
-            if api_path not in {"/v3/place_order", "/v3/query_order"}:
-                continue
-            detail = _order_detail(event.get("resp"))
-            if detail is None:
-                continue
-            params = event.get("params")
-            params = params if isinstance(params, dict) else {}
+    events: list[dict[str, Any]] = []
+    path = Path(journal_path) if journal_path is not None else None
+    if path is not None and path.exists():
+        with path.open(encoding="utf-8") as journal:
+            for line_number, line in enumerate(journal, 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid execution journal JSON at {path}:{line_number}") from exc
+                if not isinstance(event, dict):
+                    raise ValueError(f"invalid execution journal record at {path}:{line_number}")
+                events.append(event)
+    events.extend(additional_events or [])
+
+    for event in events:
+        if not isinstance(event, dict) or event.get("account_scope") != account_scope:
+            continue
+        api_path = event.get("path")
+        if api_path not in {"/v3/place_order", "/v3/query_order"}:
+            continue
+        response = event.get("resp")
+        details = _order_details(response)
+        if not details:
+            continue
+        params = event.get("params")
+        params = params if isinstance(params, dict) else {}
+        observed_at = _finite_nonnegative(event.get("t"))
+        for detail in details:
             order_id = detail.get("OrderID") or params.get("order_id")
             if order_id is None:
                 continue
             order_id = str(order_id)
-            record = orders.setdefault(
-                order_id,
-                {
-                    "order_id": order_id,
-                    "first_seen": _finite_nonnegative(event.get("t")),
-                    "detail": None,
-                    "pair": None,
-                    "side": None,
-                    "submitted": False,
-                    "first_fill_observed": False,
-                    "first_fill_timestamp": None,
-                },
-            )
-            if record["first_seen"] is None:
-                record["first_seen"] = _finite_nonnegative(event.get("t"))
+            create_epoch = _detail_create_epoch(detail)
+            order_time = create_epoch if create_epoch is not None else observed_at
+            record = orders.setdefault(order_id, {
+                "order_id": order_id, "first_seen": order_time, "detail": None,
+                "pair": None, "side": None, "submitted": False,
+                "first_fill_observed": False, "first_fill_timestamp": None,
+                "from_exchange_history": False,
+            })
+            if order_time is not None:
+                record["first_seen"] = order_time if record["first_seen"] is None else min(record["first_seen"], order_time)
             record["pair"] = detail.get("Pair") or params.get("pair") or record["pair"]
             side = detail.get("Side") or params.get("side") or record["side"]
             record["side"] = str(side).upper() if side is not None else None
-            if api_path == "/v3/place_order":
-                record["submitted"] = True
+            # Authenticated query-order responses are proof of an order even if
+            # the original place_order predates this local journal.
+            record["submitted"] = True
+            if api_path == "/v3/query_order" and isinstance(response, dict) and isinstance(response.get("OrderMatched"), list):
+                record["from_exchange_history"] = True
             previous_detail = record["detail"]
-            record["detail"] = (
-                {**previous_detail, **detail}
-                if isinstance(previous_detail, dict)
-                else detail
-            )
+            record["detail"] = {**previous_detail, **detail} if isinstance(previous_detail, dict) else detail
             cumulative_fill = _finite_nonnegative(detail.get("FilledQuantity"))
-            if cumulative_fill is not None and cumulative_fill > 0 and not record["first_fill_observed"]:
+            if cumulative_fill is not None and cumulative_fill > 0:
                 record["first_fill_observed"] = True
-                record["first_fill_timestamp"] = _detail_fill_timestamp(detail)
+                # Backfill a missing timestamp from exchange data only.
+                if record["first_fill_timestamp"] is None:
+                    record["first_fill_timestamp"] = _detail_fill_timestamp(detail)
 
     by_coin: dict[str, list[dict[str, Any]]] = {}
     for record in orders.values():
@@ -342,33 +376,66 @@ def recover_from_execution_journal(
         lots: list[dict[str, Any]] = []
         total_bought = 0.0
         position_quantity = 0.0
-        average_basis = 0.0
+        average_basis = 0.0  # gross weighted fill price used by X18
+        average_cost_basis = 0.0  # fee-inclusive quote cost per remaining coin
+        entry_fees_quote = 0.0
+        entry_fees_base = 0.0
         ambiguous = False
         for record in sorted(
             coin_orders,
-            key=lambda item: item["first_seen"] or float("inf"),
+            key=lambda item: (
+                item["first_seen"] if item["first_seen"] is not None else float("inf"),
+                item["order_id"],
+            ),
         ):
             detail = record["detail"]
             quantity = _finite_nonnegative(detail.get("FilledQuantity"))
             price = _finite_positive(detail.get("FilledAverPrice"))
             if quantity is None or quantity <= 0 or price is None:
                 continue
+            fee_amount = _finite_nonnegative(detail.get("CommissionChargeValue"))
+            fee_coin = str(detail.get("CommissionCoin") or "").upper()
+            if fee_amount is None:
+                rate = _finite_positive(detail.get("CommissionPercent"))
+                if rate is not None:
+                    ambiguous = True
+                    break
+                fee_amount, fee_coin = 0.0, "USD"
+            if fee_amount > 0 and fee_coin not in {"USD", coin}:
+                ambiguous = True
+                break
             if record["side"] == "BUY":
-                total_bought += quantity
+                acquired_quantity = quantity
+                quote_cost = quantity * price
+                if fee_amount > 0 and fee_coin == "USD":
+                    quote_cost += fee_amount
+                elif fee_amount > 0 and fee_coin == coin:
+                    coin_delta = _absolute_positive(detail.get("CoinChange"))
+                    acquired_quantity = coin_delta if coin_delta is not None else quantity - fee_amount
+                if acquired_quantity <= 0:
+                    ambiguous = True
+                    break
+                quote_fee = fee_amount if fee_coin == "USD" else 0.0
+                base_fee = fee_amount if fee_coin == coin else 0.0
+                total_bought += acquired_quantity
                 average_basis = (
-                    (position_quantity * average_basis + quantity * price)
-                    / (position_quantity + quantity)
+                    (position_quantity * average_basis + acquired_quantity * price)
+                    / (position_quantity + acquired_quantity)
                 )
-                position_quantity += quantity
-                lots.append(
-                    {
-                        "quantity": quantity,
-                        "price": price,
-                        "timestamp": record["first_fill_timestamp"],
-                    }
+                average_cost_basis = (
+                    (position_quantity * average_cost_basis + quote_cost)
+                    / (position_quantity + acquired_quantity)
                 )
+                entry_fees_quote += quote_fee
+                entry_fees_base += base_fee
+                position_quantity += acquired_quantity
+                lots.append({"quantity": acquired_quantity, "price": price, "timestamp": record["first_fill_timestamp"]})
                 continue
-            remaining_to_sell = quantity
+            sold_quantity = quantity
+            if fee_amount > 0 and fee_coin == coin:
+                coin_delta = _absolute_positive(detail.get("CoinChange"))
+                sold_quantity = coin_delta if coin_delta is not None else quantity + fee_amount
+            remaining_to_sell = sold_quantity
             while remaining_to_sell > 1e-12 and lots:
                 consumed = min(remaining_to_sell, lots[0]["quantity"])
                 lots[0]["quantity"] -= consumed
@@ -378,12 +445,15 @@ def recover_from_execution_journal(
             if remaining_to_sell > 1e-12:
                 ambiguous = True
                 break
-            # Wallet sells have no lot identity; preserve average cost and use
-            # FIFO only to conservatively track the oldest remaining entry time.
-            position_quantity = max(0.0, position_quantity - quantity)
+            # Average cost is unchanged by partial sales; FIFO tracks the oldest surviving lot.
+            position_quantity = max(0.0, position_quantity - sold_quantity)
             if position_quantity <= 1e-12:
                 position_quantity = 0.0
                 average_basis = 0.0
+                average_cost_basis = 0.0
+                entry_fees_quote = 0.0
+                entry_fees_base = 0.0
+                total_bought = 0.0
 
         wallet_quantity = _balance_quantity(wallet[coin])
         reconstructed_quantity = sum(lot["quantity"] for lot in lots)
@@ -436,6 +506,9 @@ def recover_from_execution_journal(
         recovered_metadata = {
             **(current_meta if isinstance(current_meta, dict) else {}),
             "entry_price": basis,
+            "entry_cost_basis": average_cost_basis,
+            "entry_fees_quote": entry_fees_quote,
+            "entry_fees_base": entry_fees_base,
             "remaining_quantity": wallet_quantity,
             "entry_quantity": total_bought,
             "entry_ts": entry_ts,
@@ -445,7 +518,11 @@ def recover_from_execution_journal(
             "mfe": 0.0,
             "mae": 0.0,
             "entry_source": {
-                "type": "execution_journal",
+                "type": (
+                    "exchange_order_history"
+                    if any(record.get("from_exchange_history") for record in coin_orders)
+                    else "execution_journal"
+                ),
                 "order_ids": [record["order_id"] for record in coin_orders],
             },
         }
@@ -515,11 +592,19 @@ def apply_manual_reconciliation(
         elif unknown_timestamp:
             raise ValueError(f"{coin}: entry_ts and entry_timestamp_unknown cannot both be set")
 
+        if "entry_cost_basis" in record:
+            entry_cost_basis = _finite_positive(record.get("entry_cost_basis"))
+            if entry_cost_basis is None:
+                raise ValueError(f"{coin}: entry_cost_basis must be finite and positive")
+        else:
+            # Backward compatibility for previously documented manual records.
+            entry_cost_basis = entry_price
         canonical = {
             "record_id": record_id.strip(),
             "operator": operator.strip(),
             "source": source.strip(),
             "entry_price": entry_price,
+            "entry_cost_basis": entry_cost_basis,
             "remaining_quantity": quantity,
             "entry_ts": entry_ts,
             "entry_timestamp_unknown": unknown_timestamp,
@@ -531,8 +616,10 @@ def apply_manual_reconciliation(
             item for item in audit if item.get("record_id") == record_id
         ]
         if prior_audit:
+            prior_canonical = dict(prior_audit[0]) if len(prior_audit) == 1 else {}
+            prior_canonical.setdefault("entry_cost_basis", prior_canonical.get("entry_price"))
             if len(prior_audit) == 1 and prior_audit[0].get("coin") == coin and all(
-                prior_audit[0].get(key) == value
+                prior_canonical.get(key) == value
                 for key, value in canonical.items()
             ):
                 continue
@@ -570,6 +657,7 @@ def apply_manual_reconciliation(
         entries[coin] = {
             **previous_metadata,
             "entry_price": entry_price,
+            "entry_cost_basis": entry_cost_basis,
             "remaining_quantity": quantity,
             "entry_quantity": max(quantity, _finite_positive(previous_metadata.get("entry_quantity")) or 0),
             "entry_ts": entry_ts,

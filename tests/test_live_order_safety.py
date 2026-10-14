@@ -432,3 +432,26 @@ def test_recovery_migrates_legacy_partial_fill_accounting_without_double_booking
     assert bot.state["entries"]["BTC"]["entry_price"] == pytest.approx(102.0)
     assert bot.state["entries"]["BTC"]["remaining_quantity"] == pytest.approx(1.0)
     assert bot.state["pool_cash"]["crypto"] == pytest.approx(9897.898)
+
+
+def test_confirmed_buy_fill_tracks_gross_fill_price_and_fee_inclusive_cost_basis(tmp_path):
+    bot = make_bot(
+        tmp_path,
+        response={
+            "OrderID": 301,
+            "Status": "FILLED",
+            "FilledQuantity": 1.0,
+            "FilledAverPrice": 100.0,
+            "CommissionCoin": "USD",
+            "CommissionChargeValue": 0.1,
+        },
+    )
+    assert bot._order(
+        "BTC", "BUY", 1.0,
+        {"BTC/USD": {"LastPrice": 100.0, "MinAsk": 100.0}},
+        "cost-basis-test",
+    ) is True
+    meta = bot.state["entries"]["BTC"]
+    assert meta["entry_price"] == pytest.approx(100.0)
+    assert meta["entry_cost_basis"] == pytest.approx(100.1)
+    assert meta["entry_fees_quote"] == pytest.approx(0.1)

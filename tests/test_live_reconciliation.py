@@ -108,6 +108,9 @@ def test_execution_journal_recovers_weighted_basis_partial_fills_and_fifo_age_af
                     "Status": "PARTIAL",
                     "FilledQuantity": 1,
                     "FilledAverPrice": 100,
+                    "CommissionCoin": "USD",
+                    "CommissionChargeValue": 0.0,
+                    "CommissionPercent": 0.0,
                     "Side": "BUY",
                     "Pair": "BTC/USD",
                     "FilledTime": "2026-10-01T10:00:00Z",
@@ -127,6 +130,9 @@ def test_execution_journal_recovers_weighted_basis_partial_fills_and_fifo_age_af
                     "Status": "FILLED",
                     "FilledQuantity": 2,
                     "FilledAverPrice": 100,
+                    "CommissionCoin": "USD",
+                    "CommissionChargeValue": 0.0,
+                    "CommissionPercent": 0.0,
                     "Side": "BUY",
                     "Pair": "BTC/USD",
                     "FilledTime": "2026-10-01T10:00:00Z",
@@ -146,6 +152,9 @@ def test_execution_journal_recovers_weighted_basis_partial_fills_and_fifo_age_af
                     "Status": "FILLED",
                     "FilledQuantity": 0.5,
                     "FilledAverPrice": 120,
+                    "CommissionCoin": "USD",
+                    "CommissionChargeValue": 0.0,
+                    "CommissionPercent": 0.0,
                     "Side": "BUY",
                     "Pair": "BTC/USD",
                     "FilledTime": "2026-10-02T10:00:00Z",
@@ -165,6 +174,9 @@ def test_execution_journal_recovers_weighted_basis_partial_fills_and_fifo_age_af
                     "Status": "FILLED",
                     "FilledQuantity": 0.25,
                     "FilledAverPrice": 130,
+                    "CommissionCoin": "USD",
+                    "CommissionChargeValue": 0.0,
+                    "CommissionPercent": 0.0,
                     "Side": "SELL",
                     "Pair": "BTC/USD",
                     "FilledTime": "2026-10-03T10:00:00Z",
@@ -772,3 +784,206 @@ def test_reported_dry_run_order_respects_cash_fraction_and_precision(tmp_path):
     )
     assert bot._order("S", "BUY", quantity + 0.1, ticker, "test") is False
     assert not bot.state_path.exists()
+
+
+def test_exchange_order_matched_history_recovers_four_holdings_and_quote_fees(tmp_path):
+    scope = execution_journal_scope("test-key")
+    holdings = {"BTC": 0.08992, "CAKE": 3011.12, "EDEN": 111203.6, "FIL": 5786.78}
+    prices = {"BTC": 50000.0, "CAKE": 10.0, "EDEN": 0.2, "FIL": 4.0}
+    wallet = {coin: {"Free": qty, "Lock": 0.0} for coin, qty in holdings.items()}
+    pairs = {f"{coin}/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 8} for coin in holdings}
+    journal = tmp_path / "api_journal.jsonl"
+    events = []
+    for i, (coin, qty) in enumerate(holdings.items(), start=1):
+        price = prices[coin]
+        detail = {
+            "OrderID": i, "Pair": f"{coin}/USD", "Side": "BUY", "Status": "FILLED",
+            "FilledQuantity": qty, "FilledAverPrice": price,
+            "CommissionCoin": "USD", "CommissionChargeValue": qty * price * 0.001,
+            "CommissionPercent": 0.001, "CreateTimestamp": 1790841600000 + i * 1000,
+            "FinishTimestamp": 1790841601000 + i * 1000,
+        }
+        events.append({
+            "t": 1790841602 + i, "account_scope": scope, "method": "POST",
+            "path": "/v3/query_order", "params": {"pair": f"{coin}/USD", "pending_only": "FALSE"},
+            "resp": {"Success": True, "OrderMatched": [detail]},
+        })
+    journal.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    entries, required = {}, {}
+    recovered = recover_from_execution_journal(journal, wallet, pairs, entries, required, account_scope=scope)
+    assert set(recovered) == set(holdings)
+    for coin, qty in holdings.items():
+        assert entries[coin]["remaining_quantity"] == pytest.approx(qty)
+        assert entries[coin]["entry_price"] == pytest.approx(prices[coin])
+        assert entries[coin]["entry_cost_basis"] == pytest.approx(prices[coin] * 1.001)
+        assert entries[coin]["entry_fees_quote"] == pytest.approx(qty * prices[coin] * 0.001)
+        assert entries[coin]["entry_ts"] is not None
+        assert entries[coin]["entry_source"]["type"] == "exchange_order_history"
+    held, unresolved = reconcile_crypto_holdings(wallet, pairs, entries, required)
+    assert set(held) == set(holdings)
+    assert unresolved == []
+
+
+def test_query_history_backfills_timestamp_from_filled_finish_timestamp(tmp_path):
+    scope = execution_journal_scope("test-key")
+    journal = tmp_path / "api_journal.jsonl"
+    events = [
+        {"t": 1790841602, "account_scope": scope, "method": "POST", "path": "/v3/place_order",
+         "params": {"pair": "BTC/USD", "side": "BUY"},
+         "resp": {"Success": True, "OrderDetail": {
+             "OrderID": 99, "Pair": "BTC/USD", "Side": "BUY", "Status": "PARTIAL",
+             "FilledQuantity": 0.4, "FilledAverPrice": 100, "CommissionCoin": "USD",
+             "CommissionChargeValue": 0.0, "CommissionPercent": 0.0}}},
+        {"t": 1790841603, "account_scope": scope, "method": "POST", "path": "/v3/query_order",
+         "params": {"pair": "BTC/USD", "pending_only": "FALSE"},
+         "resp": {"Success": True, "OrderMatched": [{
+             "OrderID": 99, "Pair": "BTC/USD", "Side": "BUY", "Status": "FILLED",
+             "FilledQuantity": 1.0, "FilledAverPrice": 100, "CommissionCoin": "USD",
+             "CommissionChargeValue": 0.0, "CommissionPercent": 0.0,
+             "CreateTimestamp": 1790841600000, "FinishTimestamp": 1790841601000}]}}
+    ]
+    journal.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    entries, required = {}, {}
+    recovered = recover_from_execution_journal(
+        journal, {"BTC": {"Free": 1.0, "Lock": 0}},
+        {"BTC/USD": {"AssetType": "crypto", "CanTrade": True}},
+        entries, required, account_scope=scope,
+    )
+    assert recovered == ["BTC"]
+    assert entries["BTC"]["entry_ts"] == pd.Timestamp(1790841601000, unit="ms", tz="UTC").isoformat()
+
+
+def test_no_history_keeps_all_four_holdings_unresolved():
+    holdings = {"BTC": 0.08992, "CAKE": 3011.12, "EDEN": 111203.6, "FIL": 5786.78}
+    wallet = {coin: {"Free": qty, "Lock": 0} for coin, qty in holdings.items()}
+    pairs = {f"{coin}/USD": {"AssetType": "crypto", "CanTrade": True} for coin in holdings}
+    entries, required = {}, {}
+    held, unresolved = reconcile_crypto_holdings(wallet, pairs, entries, required)
+    assert set(held) == set(holdings)
+    assert set(unresolved) == set(holdings)
+    assert all(required[coin]["reason"] == "missing_verified_entry_cost_basis" for coin in holdings)
+
+
+def test_bot_suppresses_exit_when_exchange_quantity_mismatches_ledger(tmp_path):
+    cfg_path = tmp_path / "live.yaml"
+    cfg_path.write_text(
+        "mode: run\ncrypto_weight: 1.0\npos_frac: 0.1\n"
+        "max_pos: {crypto: 5, equity: 0}\n"
+        "position_reconciliation: {unknown_basis_policy: manual_reconciliation_freeze_entries}\n"
+        "x18: {enabled: true, hard_stop_net_pct: 0.08, soft_time_bars: 216, "
+        "soft_time_min_net_pct: 0.015, cooldown_bars: 3}\n",
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "state" / "ledger.json"
+    ledger.parent.mkdir()
+    state = {"pool_cash": {"crypto": 1000.0, "equity": 0.0}, "entries": {
+        "BTC": {"entry_price": 100.0, "entry_ts": "2026-10-01T10:00:00Z",
+                "entry_signal_bar_ts": "2026-10-01T10:00:00Z", "remaining_quantity": 0.5}}}
+    ledger.write_text(json.dumps(state), encoding="utf-8")
+    before = ledger.read_bytes()
+    bot = object.__new__(Bot)
+    bot.cfg_path, bot.cfg, bot.dry, bot.state_path, bot.state = cfg_path, {}, True, ledger, state
+    bot.pairs = {"BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 8, "MiniOrder": 5}}
+    bot.freq = 30
+    submitted = []
+    bot.api = SimpleNamespace(
+        key="test-key", journal=None,
+        ticker=lambda: {"BTC/USD": {"LastPrice": 80, "MaxBid": 80, "MinAsk": 81}},
+        balance=lambda: {"USD": {"Free": 1000, "Lock": 0}, "BTC": {"Free": 1.0, "Lock": 0}},
+        query_order_history=lambda **kwargs: [],
+        place_order=lambda *args: submitted.append(args),
+    )
+    bot.signals = lambda: (_ for _ in ()).throw(RuntimeError("signal feed unavailable"))
+    bot.cycle()
+    assert bot.state["reconciliation_required"]["BTC"]["reason"] == "exchange_local_quantity_mismatch"
+    assert "unreconciled exchange holdings" in bot._entry_freeze_reasons
+    assert submitted == []
+    assert ledger.read_bytes() == before
+
+
+def test_dry_run_queries_exchange_history_and_reconciles_four_holdings_without_orders(tmp_path):
+    holdings = {"BTC": 0.08992, "CAKE": 3011.12, "EDEN": 111203.6, "FIL": 5786.78}
+    prices = {"BTC": 50000.0, "CAKE": 10.0, "EDEN": 0.2, "FIL": 4.0}
+    cfg_path = tmp_path / "live.yaml"
+    cfg_path.write_text(
+        "mode: run\ncrypto_weight: 1.0\npos_frac: 0.1\n"
+        "max_pos: {crypto: 5, equity: 0}\n"
+        "position_reconciliation: {unknown_basis_policy: manual_reconciliation_freeze_entries}\n"
+        "x18: {enabled: true, hard_stop_net_pct: 0.08, soft_time_bars: 216, "
+        "soft_time_min_net_pct: 0.015, cooldown_bars: 3}\n",
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "state" / "ledger.json"
+    ledger.parent.mkdir()
+    state = {"pool_cash": {"crypto": 1000.0, "equity": 0.0}, "entries": {}}
+    ledger.write_text(json.dumps(state), encoding="utf-8")
+    before = ledger.read_bytes()
+    pairs = {
+        f"{coin}/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 8, "MiniOrder": 5}
+        for coin in holdings
+    }
+    wallet = {"USD": {"Free": 1000, "Lock": 0}}
+    ticker = {}
+    for coin, qty in holdings.items():
+        price = prices[coin]
+        wallet[coin] = {"Free": qty, "Lock": 0}
+        ticker[f"{coin}/USD"] = {"LastPrice": price * 1.1, "MaxBid": price * 1.1, "MinAsk": price * 1.101}
+    history_calls = []
+    def query_order_history(*, pair):
+        history_calls.append(pair)
+        coin = pair.split("/", 1)[0]
+        qty, price = holdings[coin], prices[coin]
+        return [{
+            "OrderID": 100 + len(history_calls), "Pair": pair, "Side": "BUY", "Status": "FILLED",
+            "FilledQuantity": qty, "FilledAverPrice": price,
+            "CommissionCoin": "USD", "CommissionChargeValue": qty * price * 0.001,
+            "CommissionPercent": 0.001, "CreateTimestamp": 1790841600000,
+            "FinishTimestamp": 1790841601000,
+        }]
+    bot = object.__new__(Bot)
+    bot.cfg_path, bot.cfg, bot.dry, bot.state_path, bot.state = cfg_path, {}, True, ledger, state
+    bot.pairs, bot.freq = pairs, 30
+    bot.api = SimpleNamespace(
+        key="test-key", journal=None, ticker=lambda: ticker, balance=lambda: wallet,
+        query_order_history=query_order_history,
+        place_order=lambda *args: pytest.fail("dry-run must never submit a real order"),
+    )
+    bot.signals = lambda: (_ for _ in ()).throw(RuntimeError("feed unavailable"))
+
+    bot.cycle()
+
+    assert set(history_calls) == {f"{coin}/USD" for coin in holdings}
+    assert set(bot.state["entries"]) == set(holdings)
+    assert set(bot._held_quantities) == set(holdings)
+    assert not set(holdings).intersection(bot.state.get("reconciliation_required", {}))
+    assert all(bot.state["reconciliation_history"][coin]["status"] == "queried" for coin in holdings)
+    assert {event["coin"] for event in bot.state["reconciliation_audit"] if event.get("action") == "automatic_position_recovery"} == set(holdings)
+    assert ledger.read_bytes() == before
+
+
+def test_recovery_accounts_for_base_coin_commission_using_exchange_coin_delta(tmp_path):
+    scope = execution_journal_scope("base-fee-account")
+    qty, price, fee = 0.99, 100.0, 0.01
+    detail = {
+        "OrderID": "base-fee-buy", "Pair": "BTC/USD", "Side": "BUY", "Status": "FILLED",
+        "FilledQuantity": 1.0, "FilledAverPrice": price,
+        "CommissionCoin": "BTC", "CommissionChargeValue": fee, "CommissionPercent": 0.001,
+        "CoinChange": -qty, "CreateTimestamp": 1790841600000, "FinishTimestamp": 1790841601000,
+    }
+    journal = tmp_path / "api_journal.jsonl"
+    journal.write_text(json.dumps({
+        "t": 1790841602, "account_scope": scope, "method": "POST", "path": "/v3/query_order",
+        "params": {"pair": "BTC/USD", "pending_only": "FALSE"},
+        "resp": {"Success": True, "OrderMatched": [detail]},
+    }) + "\n", encoding="utf-8")
+    entries, required = {}, {}
+    recovered = recover_from_execution_journal(
+        journal, {"BTC": {"Free": qty, "Lock": 0}},
+        {"BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 8}},
+        entries, required, account_scope=scope,
+    )
+    assert recovered == ["BTC"]
+    assert entries["BTC"]["remaining_quantity"] == pytest.approx(qty)
+    assert entries["BTC"]["entry_price"] == pytest.approx(price)
+    assert entries["BTC"]["entry_cost_basis"] == pytest.approx(price / qty)
+    assert entries["BTC"]["entry_fees_base"] == pytest.approx(fee)

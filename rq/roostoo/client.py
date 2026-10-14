@@ -158,6 +158,50 @@ class RoostooClient:
                 p["pending_only"] = "TRUE" if pending_only else "FALSE"
         return self._ok(self._request("POST", "/v3/query_order", p, signed=True))
 
+    def query_order_history(
+        self, pair: str, *, limit: int = 100, max_pages: int = 100
+    ) -> list[dict]:
+        """Read pair order history through the authenticated, read-only query endpoint."""
+        if not isinstance(pair, str) or pair.count("/") != 1 or not all(pair.split("/")):
+            raise ValueError("pair must be a BASE/QUOTE string")
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if isinstance(max_pages, bool) or int(max_pages) < 1:
+            raise ValueError("max_pages must be >= 1")
+        found: dict[str, dict] = {}
+        offset = 0
+        for _ in range(int(max_pages)):
+            response = self._request(
+                "POST", "/v3/query_order",
+                {"pair": pair, "offset": offset, "limit": int(limit), "pending_only": "FALSE"},
+                signed=True,
+            )
+            if not isinstance(response, dict):
+                raise RoostooError("invalid query-order history response")
+            if response.get("Success") is False:
+                message = str(response.get("ErrMsg", "")).lower()
+                if "no order matched" in message:
+                    return sorted(found.values(), key=lambda x: (float(x.get("CreateTimestamp") or 0), str(x.get("OrderID") or "")))
+                raise RoostooError(response.get("ErrMsg", "query-order history failed"))
+            matches = response.get("OrderMatched")
+            if not isinstance(matches, list):
+                raise RoostooError("query-order history response lacks OrderMatched list")
+            for detail in matches:
+                if not isinstance(detail, dict) or not detail.get("OrderID"):
+                    raise RoostooError("query-order history contains an invalid order record")
+                if detail.get("Pair") != pair:
+                    raise RoostooError("query-order history returned an unexpected pair")
+                order_id = str(detail["OrderID"])
+                previous = found.get(order_id)
+                if previous is None or float(detail.get("FilledQuantity") or 0) >= float(previous.get("FilledQuantity") or 0):
+                    found[order_id] = {**(previous or {}), **detail}
+            if not matches:
+                return sorted(found.values(), key=lambda x: (float(x.get("CreateTimestamp") or 0), str(x.get("OrderID") or "")))
+            offset += len(matches)
+            if len(matches) < int(limit):
+                return sorted(found.values(), key=lambda x: (float(x.get("CreateTimestamp") or 0), str(x.get("OrderID") or "")))
+        raise RoostooError(f"query-order history exceeded {max_pages} pages; refusing incomplete reconciliation")
+
     def cancel_order(self, order_id: str | None = None, pair: str | None = None) -> dict:
         p = {"order_id": str(order_id)} if order_id else ({"pair": pair} if pair else {})
         return self._request("POST", "/v3/cancel_order", p, signed=True)
