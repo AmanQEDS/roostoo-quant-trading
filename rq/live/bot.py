@@ -867,7 +867,7 @@ class Bot:
         log.info(
             "ORDER_INTENT %s",
             json.dumps({
-                "ts": pd.Timestamp.utcnow().isoformat(),
+                "ts": pd.Timestamp.now(tz='UTC').isoformat(),
                 "symbol": pair, "side": side, "qty": qty, "reason": reason,
                 "entry_price": entry_price, "entry_ts": meta.get("entry_ts"),
                 "last_price": last_price or None, "unrealized_pnl": unrealized,
@@ -920,6 +920,16 @@ class Bot:
             return False
 
         try:
+            if not isinstance(d, dict):
+                raise TypeError("Order response is not a dictionary")
+
+            order_status = str(d.get("Status") or "").upper()
+            pending = self.state["pending_order"]
+            pending["order_id"] = d.get("OrderID")
+            pending["exchange_status"] = order_status or None
+            pending["response"] = d
+            self.save()
+
             filled_qty = float(d.get("FilledQuantity") or 0)
             fill_px = float(d.get("FilledAverPrice") or 0)
             fee = float(d.get("CommissionChargeValue") or 0)
@@ -977,24 +987,31 @@ class Bot:
                     pair, qty, filled_qty,
                 )
 
-        # Keep trading halted when the exchange reports a partial fill.
-        # Reconcile the remaining order before allowing another submission.
+        # A quantity alone does not prove the exchange order is finished.
+        # Clear only for a confirmed FILLED status and full requested quantity.
         fill_tolerance = max(1e-12, float(qty) * 1e-8)
-        if filled_qty + fill_tolerance < float(qty):
+        fully_filled = (
+            order_status == "FILLED"
+            and filled_qty + fill_tolerance >= float(qty)
+        )
+        if not fully_filled:
             pending = self.state["pending_order"]
-            pending["status"] = "partial_fill"
+            pending["status"] = (
+                "partial_fill"
+                if filled_qty + fill_tolerance < float(qty)
+                else "reconciliation_required"
+            )
             pending["filled_quantity"] = filled_qty
             pending["average_fill_price"] = fill_px
-            pending["response"] = d
             self.save()
             log.critical(
-                "PARTIAL FILL: %s requested=%s filled=%s; "
-                "trading remains blocked pending reconciliation",
-                pair, qty, filled_qty,
+                "ORDER NOT CONFIRMED COMPLETE: %s status=%s "
+                "requested=%s filled=%s; trading remains blocked",
+                pair, order_status or "UNKNOWN", qty, filled_qty,
             )
             return False
 
-        # Clear only after a full fill has been recorded and saved.
+        # Clear only after a confirmed full fill has been recorded and saved.
         self.state.pop("pending_order", None)
         self.save()
 

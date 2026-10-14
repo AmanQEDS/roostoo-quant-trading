@@ -61,6 +61,8 @@ def test_empty_fill_response_keeps_pending_marker(tmp_path):
     bot = make_bot(
         tmp_path,
         response={
+            "OrderID": 103,
+            "Status": "PENDING",
             "FilledQuantity": 0,
             "FilledAverPrice": 0,
             "CommissionChargeValue": 0,
@@ -77,6 +79,8 @@ def test_partial_fill_keeps_marker_and_records_filled_quantity(tmp_path):
     bot = make_bot(
         tmp_path,
         response={
+            "OrderID": 102,
+            "Status": "PENDING",
             "FilledQuantity": 0.4,
             "FilledAverPrice": 100.0,
             "CommissionChargeValue": 0.1,
@@ -98,6 +102,8 @@ def test_full_fill_clears_marker_after_recording_fill(tmp_path):
     bot = make_bot(
         tmp_path,
         response={
+            "OrderID": 101,
+            "Status": "FILLED",
             "FilledQuantity": 1.0,
             "FilledAverPrice": 100.0,
             "CommissionChargeValue": 0.1,
@@ -139,3 +145,46 @@ def test_save_creates_parent_and_replaces_ledger_atomically(tmp_path):
 
     assert json.loads(bot.state_path.read_text(encoding="utf-8"))["sample"] == "persisted"
     assert not bot.state_path.with_suffix(".json.tmp").exists()
+
+
+@pytest.mark.parametrize("status", ["PENDING", "CANCELED", "UNKNOWN"])
+def test_non_filled_status_never_clears_pending_marker(tmp_path, status):
+    bot = make_bot(
+        tmp_path,
+        response={
+            "OrderID": 204,
+            "Status": status,
+            "FilledQuantity": 1.0,
+            "FilledAverPrice": 100.0,
+            "CommissionChargeValue": 0.1,
+        },
+    )
+
+    assert bot._order(
+        "BTC", "BUY", 1.0, {"BTC/USD": {"LastPrice": 100.0}}, "test"
+    ) is False
+    assert bot.state["pending_order"]["order_id"] == 204
+    assert bot.state["pending_order"]["exchange_status"] == status
+    assert bot.state["pending_order"]["status"] == "reconciliation_required"
+
+    saved = json.loads(bot.state_path.read_text(encoding="utf-8"))
+    assert saved["pending_order"]["order_id"] == 204
+
+
+def test_confirmed_full_fill_persists_order_id_in_response_before_clear(tmp_path):
+    bot = make_bot(
+        tmp_path,
+        response={
+            "OrderID": 205,
+            "Status": "FILLED",
+            "FilledQuantity": 1.0,
+            "FilledAverPrice": 100.0,
+            "CommissionChargeValue": 0.1,
+        },
+    )
+
+    assert bot._order(
+        "BTC", "BUY", 1.0, {"BTC/USD": {"LastPrice": 100.0}}, "test"
+    ) is True
+    assert "pending_order" not in bot.state
+    assert bot.state["entries"]["BTC"]["entry_price"] == pytest.approx(100.0)
