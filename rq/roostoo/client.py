@@ -30,6 +30,7 @@ class RoostooClient:
                  min_interval_s: float = 0.4, timeout: float = 10.0, max_retries: int = 3):
         self.key = api_key or os.environ.get("ROOSTOO_API_KEY", "")
         self.secret = secret or os.environ.get("ROOSTOO_API_SECRET", "")
+        self.journal_scope = hashlib.sha256(self.key.encode()).hexdigest()[:16]
         self.base = base_url.rstrip("/")
         self.journal = Path(journal) if journal else None
         if self.journal:
@@ -87,7 +88,8 @@ class RoostooClient:
                                    params=None if isinstance(query, str) else query,
                                    data=body, timeout=self.timeout)
                 data = r.json()
-                self._log({"t": time.time(), "method": method, "path": path,
+                self._log({"t": time.time(), "account_scope": self.journal_scope,
+                           "method": method, "path": path,
                            "params": {k: v for k, v in params.items() if k != "timestamp"},
                            "http": r.status_code, "latency_s": round(time.time() - t0, 4),
                            "resp": data})
@@ -96,7 +98,8 @@ class RoostooClient:
                 return data
             except (requests.RequestException, ValueError, RoostooError) as e:
                 last_err = e
-                self._log({"t": time.time(), "method": method, "path": path, "error": repr(e),
+                self._log({"t": time.time(), "account_scope": self.journal_scope,
+                           "method": method, "path": path, "error": repr(e),
                            "attempt": attempt})
                 if attempt + 1 < max_attempts:
                     time.sleep(min(2 ** attempt, 8))

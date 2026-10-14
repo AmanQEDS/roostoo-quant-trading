@@ -27,7 +27,13 @@ from ..signals.core import to_target
 from ..research.runner import ALL_BUILDERS
 from .instance_lock import InstanceLock
 from .position_exits import position_exit_reason, short_trend_failure
-from .reconciliation import reconcile_crypto_holdings
+from .reconciliation import (
+    UNKNOWN_TIME_POLICY,
+    apply_manual_reconciliation,
+    execution_journal_scope,
+    reconcile_crypto_holdings,
+    recover_from_execution_journal,
+)
 from .regime_filter import f2_regime
 from .x18 import completed_bars_held, x18_exit_reason
 
@@ -605,6 +611,44 @@ class Bot:
             "reconciliation_required", {}
         )
         entries = self.state.setdefault("entries", {})
+        audit = self.state.setdefault("reconciliation_audit", [])
+        if not isinstance(audit, list):
+            raise ValueError("ledger reconciliation_audit must be a list")
+        recovered = recover_from_execution_journal(
+            getattr(self.api, "journal", None),
+            wallet,
+            self.pairs,
+            entries,
+            reconciliation_required,
+            account_scope=execution_journal_scope(
+                getattr(self.api, "key", "")
+            ),
+        )
+        if recovered:
+            log.warning(
+                "POSITION HISTORY RECOVERED from persisted confirmed order records: %s",
+                ", ".join(sorted(recovered)),
+            )
+        manual_path = self.state_path.with_name("reconciliation_manual.json")
+        if manual_path.exists():
+            manual_document = json.loads(manual_path.read_text(encoding="utf-8"))
+            if not isinstance(manual_document, dict):
+                raise ValueError(
+                    f"manual reconciliation file must contain a JSON object: {manual_path}"
+                )
+            manually_reconciled = apply_manual_reconciliation(
+                manual_document,
+                wallet,
+                self.pairs,
+                entries,
+                reconciliation_required,
+                audit,
+            )
+            if manually_reconciled:
+                log.warning(
+                    "POSITION HISTORY MANUALLY RECONCILED with audited operator evidence: %s",
+                    ", ".join(sorted(manually_reconciled)),
+                )
         held, unresolved = reconcile_crypto_holdings(
             wallet,
             self.pairs,
@@ -628,6 +672,16 @@ class Bot:
         for coin in held:
             meta = entries.get(coin, {})
             if not (meta.get("entry_signal_bar_ts") or meta.get("entry_ts")):
+                if (
+                    meta.get("entry_time_status") == "unknown_operator_attested"
+                    and meta.get("time_exit_policy") == UNKNOWN_TIME_POLICY
+                ):
+                    log.critical(
+                        "TIME EXIT DISABLED by explicit reconciliation for %s: "
+                        "original entry timestamp is unknown; hard-stop and signal exits remain enabled",
+                        coin,
+                    )
+                    continue
                 marker = reconciliation_required.setdefault(
                     coin,
                     {
@@ -802,18 +856,28 @@ class Bot:
                         coin,
                     )
 
-                bars_held = completed_bars_held(
-                    meta.get("entry_signal_bar_ts") or meta.get("entry_ts"),
-                    current_bar,
-                    self.freq,
-                )
-                if bars_held is None:
-                    self._entry_freeze_reasons.append("X18 hold age unavailable")
-                    log.critical(
-                        "X18 TIME EXIT UNAVAILABLE for %s: timestamps are missing, invalid, "
-                        "future-dated, or no completed signal bar is available; hard stop remains active",
-                        coin,
+                time_exit_disabled = (
+                    meta.get("entry_time_status") == "unknown_operator_attested"
+                    and meta.get("time_exit_policy") == UNKNOWN_TIME_POLICY
+                    and not (
+                        meta.get("entry_signal_bar_ts") or meta.get("entry_ts")
                     )
+                )
+                if time_exit_disabled:
+                    bars_held = None
+                else:
+                    bars_held = completed_bars_held(
+                        meta.get("entry_signal_bar_ts") or meta.get("entry_ts"),
+                        current_bar,
+                        self.freq,
+                    )
+                    if bars_held is None:
+                        self._entry_freeze_reasons.append("X18 hold age unavailable")
+                        log.critical(
+                            "X18 TIME EXIT UNAVAILABLE for %s: timestamps are missing, invalid, "
+                            "future-dated, or no completed signal bar is available; hard stop remains active",
+                            coin,
+                        )
                 reason = x18_exit_reason(
                     entry_price=entry_px,
                     sell_price=sell_px,

@@ -1230,11 +1230,13 @@ final value = starting capital + realized P&L + unrealized P&L
 
 ### 18.4 Existing portfolio handling
 
-The bot does not assume the account starts empty. At startup it reads the current Roostoo wallet and reconciles existing holdings.
+The bot does not assume the account starts empty. At startup it reads the current Roostoo wallet and compares each holding with verified position metadata. A wallet balance without a matching verified cost basis and quantity is **not** treated as a strategy entry; it remains unresolved, blocks new entries, and is not automatically sold.
 
 | Holding type | Handling |
 |---|---|
-| Existing **crypto** | Handled by normal portfolio-management logic |
+| Existing **crypto with verified metadata** | Managed by normal position exit logic |
+| Existing **crypto with recoverable execution records** | Reconstructed from persisted successful place/query-order responses only when reconstructed net fills match the exchange wallet quantity |
+| Existing **crypto with missing/unverifiable metadata** | Entry freeze; retain the position until manual reconciliation |
 | Existing **equity** | Handled by a dedicated liquidation path, because the production strategy is crypto-only |
 | Dust | Ignored below the ~$5 marked-value threshold |
 
@@ -1242,12 +1244,49 @@ After liquidation, the wallet is refreshed so subsequent crypto position sizing 
 
 ### 18.5 Wallet reconciliation
 
-The wallet is the **source of truth** for available cash and holdings. Local state is reconciled against the exchange, which reduces divergence after:
+The wallet is the **source of truth** for available cash and held quantity, but it is not a source of entry cost basis. Account-scoped persisted order responses in `logs/api_journal.jsonl` are replayed first where available. Each request is tagged with a truncated SHA-256 fingerprint of the API key; the credential itself is never written to the journal. Records without the matching fingerprint (including older unscoped journals) are not trusted for automatic recovery, avoiding accidental mixing of General Portfolio and competition-account orders. The replay deduplicates order updates by exchange order ID, accounts for cumulative partial fills and sells, and accepts recovered metadata only when the resulting quantity matches the wallet within exchange amount precision. Journal observation timestamps are never substituted for fill timestamps. A missing/unsupported order record, unknown entry time, unsupported pair, missing executable bid, or wallet/ledger quantity mismatch remains visible in `state/ledger.json` under `reconciliation_required` and blocks entries.
 
-- partial fills,
-- rejected orders,
-- process restarts,
-- external account changes.
+#### Manual reconciliation procedure
+
+If the journal cannot establish the position basis and quantity, verify them from Roostoo's actual order/fill history or other authoritative account records. Do not use the current ticker price as cost basis. Stop the live bot before editing reconciliation input. Create `state/reconciliation_manual.json` next to the ledger in this format:
+
+```json
+{
+  "positions": {
+    "BTC": {
+      "record_id": "review-2026-10-14-btc-01",
+      "operator": "reviewer name",
+      "source": "Roostoo fill history; order IDs 12345 and 12346",
+      "entry_price": 62000.5,
+      "remaining_quantity": 0.0125,
+      "entry_ts": "2026-10-01T12:30:00Z"
+    }
+  }
+}
+```
+
+Use one symbol per position. `entry_price` must be the verified weighted cost basis in quote currency; `remaining_quantity` must equal the current exchange free-plus-locked quantity at the exchange's supported amount precision; `entry_ts` must be the verified, timezone-aware original entry time. `record_id`, `operator`, and an evidence `source` are required. The bot validates the pair, values, timestamp and wallet quantity before updating `entries`; it appends the prior metadata and attestation to `reconciliation_audit`. A record ID is idempotent and cannot be reused with changed data. Invalid input fails closed; the reconciliation flag is not cleared.
+
+If the original entry time cannot be established, **do not fabricate one**. Explicitly attest that fact and accept the conservative fallback below:
+
+```json
+{
+  "positions": {
+    "BTC": {
+      "record_id": "review-2026-10-14-btc-02",
+      "operator": "reviewer name",
+      "source": "Roostoo fill history confirms basis; original fill time unavailable",
+      "entry_price": 62000.5,
+      "remaining_quantity": 0.0125,
+      "entry_ts": null,
+      "entry_timestamp_unknown": true,
+      "time_exit_policy": "disable_time_exit_until_verified_timestamp"
+    }
+  }
+}
+```
+
+This explicit operator attestation completes basis/quantity reconciliation without inventing a timestamp. X18 time-based exits remain disabled for that position until a verified timestamp is supplied; hard-stop and available signal exits continue to apply. The fallback and attestation remain recorded in position metadata and the audit trail. Entries can resume only after every held position is either verified or explicitly reconciled under this fallback, and all other reconciliation issues (such as an unavailable bid or unsupported pair) are cleared.
 
 ### 18.6 Start gate
 
