@@ -1368,10 +1368,20 @@ class Bot:
                     new_price = new_cost / new_qty
                     if not math.isfinite(new_price) or new_price <= 0:
                         raise ValueError("Unable to derive a positive average entry cost from confirmed fills")
+                    commission_coin = str(detail.get("CommissionCoin") or "USD").upper()
+                    quote_fee_delta = delta_fee if commission_coin == "USD" else 0.0
+                    base_fee_delta = delta_fee if commission_coin == coin else 0.0
+                    old_cost_basis = _finite_float(meta.get("entry_cost_basis"), old_price)
+                    new_cost_basis = (
+                        old_qty * old_cost_basis + delta_notional + quote_fee_delta
+                    ) / new_qty
                     pool_cash["crypto"] -= delta_notional + delta_fee
                     meta.update(
                         {
                             "entry_price": new_price,
+                            "entry_cost_basis": new_cost_basis,
+                            "entry_fees_quote": _finite_float(meta.get("entry_fees_quote")) + quote_fee_delta,
+                            "entry_fees_base": _finite_float(meta.get("entry_fees_base")) + base_fee_delta,
                             "remaining_quantity": new_qty,
                             "entry_quantity": _finite_float(
                                 meta.get("entry_quantity"), old_qty
