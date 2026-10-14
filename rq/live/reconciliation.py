@@ -179,7 +179,7 @@ def reconcile_crypto_holdings(
             unresolved.append(coin)
 
     for coin in list(entries):
-        if coin not in held:
+        if coin not in wallet_assets:
             entries.pop(coin, None)
     for coin in list(reconciliation_required):
         if coin not in wallet_assets:

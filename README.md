@@ -1237,6 +1237,7 @@ The bot does not assume the account starts empty. At startup it reads the curren
 | Existing **crypto with verified metadata** | Managed by normal position exit logic |
 | Existing **crypto with recoverable execution records** | Reconstructed from account-scoped journal records and read-only Roostoo order-history pages only when verified fills match the exchange wallet quantity |
 | Existing **crypto with missing/unverifiable metadata** | Entry freeze; retain the position until manual reconciliation |
+| Wallet-held asset with no supported crypto pair | Reported as unresolved in the reconciliation audit; retain its ledger metadata and do not submit an automatic order |
 | Existing **equity** | Handled by a dedicated liquidation path, because the production strategy is crypto-only |
 | Dust | Ignored below the ~$5 marked-value threshold |
 

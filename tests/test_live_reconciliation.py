@@ -91,6 +91,30 @@ def test_unsupported_exchange_pair_remains_unresolved():
     assert required["EDEN"]["reason"] == "exchange_pair_not_tradable"
 
 
+def test_unsupported_held_asset_preserves_existing_ledger_metadata():
+    entries = {
+        "EDEN": {
+            "entry_price": 0.2,
+            "entry_ts": "2026-10-01T10:00:00Z",
+            "remaining_quantity": 10,
+        }
+    }
+    original = json.loads(json.dumps(entries))
+    required = {}
+
+    held, unresolved = reconcile_crypto_holdings(
+        {"EDEN": {"Free": 10, "Lock": 0}},
+        {},
+        entries,
+        required,
+    )
+
+    assert held == {}
+    assert unresolved == ["EDEN"]
+    assert entries == original
+    assert required["EDEN"]["reason"] == "held_asset_not_in_supported_crypto_pairs"
+
+
 def test_execution_journal_recovers_weighted_basis_partial_fills_and_fifo_age_after_sell(tmp_path):
     journal = tmp_path / "api_journal.jsonl"
     scope = execution_journal_scope("test-key")
@@ -772,7 +796,10 @@ def test_reconcile_cli_dry_run_uses_exchange_history_without_saving(tmp_path, mo
             }
 
         def balance(self):
-            return {"BTC": {"Free": 1.0, "Lock": 0.0}}
+            return {
+                "BTC": {"Free": 1.0, "Lock": 0.0},
+                "EDEN": {"Free": 2.0, "Lock": 0.0},
+            }
 
         def query_order_history(self, *, pair):
             assert pair == "BTC/USD"
@@ -797,6 +824,9 @@ def test_reconcile_cli_dry_run_uses_exchange_history_without_saving(tmp_path, mo
     output = capsys.readouterr().out
     assert "BTC" in output
     assert "RESOLVED" in output
+    assert "EDEN" in output
+    assert "UNRESOLVED" in output
+    assert "held_asset_not_in_supported_crypto_pairs" in output
     assert state_path.read_bytes() == original_bytes
 
 

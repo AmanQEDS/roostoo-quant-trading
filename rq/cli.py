@@ -190,13 +190,24 @@ def main(argv=None):
             rec_man = apply_manual_reconciliation(doc, wallet, pairs, entries, reconciliation_required, audit)
 
         held, unresolved = reconcile_crypto_holdings(wallet, pairs, entries, reconciliation_required)
+        audit_holdings = dict(held)
+        for coin, balance in wallet.items():
+            if coin == "USD":
+                continue
+            quantity = float(balance.get("Free", 0) or 0) + float(balance.get("Lock", 0) or 0)
+            if quantity > 0:
+                audit_holdings.setdefault(coin, quantity)
 
         print("\n=== POSITION RECONCILIATION AUDIT ===")
         print(f"{'Coin':<8} {'Held Qty':<14} {'Status':<12} {'Cost Basis':<14} {'Entry Time':<28} {'Source / Reason'}")
         print("-" * 95)
-        for coin, qty in sorted(held.items()):
+        for coin, qty in sorted(audit_holdings.items()):
             meta = entries.get(coin, {})
-            is_res = coin not in unresolved
+            is_res = (
+                coin in held
+                and coin not in unresolved
+                and coin not in reconciliation_required
+            )
             status_str = "RESOLVED" if is_res else "UNRESOLVED"
             basis_str = f"${meta.get('entry_price', 0):.4f}" if meta.get("entry_price") else "N/A"
             ts_str = str(meta.get("entry_ts") or meta.get("time_exit_policy") or "missing")
