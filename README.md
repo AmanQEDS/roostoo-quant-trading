@@ -1235,7 +1235,7 @@ The bot does not assume the account starts empty. At startup it reads the curren
 | Holding type | Handling |
 |---|---|
 | Existing **crypto with verified metadata** | Managed by normal position exit logic |
-| Existing **crypto with recoverable execution records** | Reconstructed from persisted successful place/query-order responses only when reconstructed net fills match the exchange wallet quantity |
+| Existing **crypto with recoverable execution records** | Reconstructed from account-scoped journal records and read-only Roostoo order-history pages only when verified fills match the exchange wallet quantity |
 | Existing **crypto with missing/unverifiable metadata** | Entry freeze; retain the position until manual reconciliation |
 | Existing **equity** | Handled by a dedicated liquidation path, because the production strategy is crypto-only |
 | Dust | Ignored below the ~$5 marked-value threshold |
@@ -1244,84 +1244,78 @@ After liquidation, the wallet is refreshed so subsequent crypto position sizing 
 
 ### 18.5 Wallet reconciliation
 
-The wallet is the **source of truth** for available cash and held quantity, but it is not a source of entry cost basis. To recover verified position metadata without inferring prices, the bot applies a multi-tier reconciliation workflow in priority order:
-
-1. **Exchange Order History Recovery (Authoritative API):** The bot queries `/v3/query_order(pending_only=False)` directly from the Roostoo exchange. It parses all confirmed fills (`OrderMatched`), converts millisecond `FinishTimestamp` / `CreateTimestamp` epoch values into timezone-aware UTC timestamps, and reconstructs historical net buys and sales using FIFO lot matching. If the reconstructed inventory matches the live exchange wallet balance within precision, the volume-weighted cost basis and entry timestamps are adopted automatically into `entries`.
-2. **Local Execution Journal Replay:** If local execution records exist in `logs/api_journal.jsonl`, they are replayed using the account-scoped SHA-256 key fingerprint.
-3. **Manual Operator Attestation:** If exchange order history is unavailable or does not explain the entire balance, the operator provides verified metadata via `state/reconciliation_manual.json`.
-
-A missing/unsupported order record, unknown entry time, unsupported pair, missing executable bid, or wallet/ledger quantity mismatch remains visible in `state/ledger.json` under `reconciliation_required` and blocks new entries fail-closed.
-
-#### Inspecting Reconciliation via CLI
-
-You can audit and verify existing holdings at any time:
-
-```bash
-# Dry-run inspection (queries exchange, displays audit table, no files modified):
-python -m rq.cli reconcile
-
-# Persist validated reconciliation to state/ledger.json:
-python -m rq.cli reconcile --confirm
-```
+The wallet is the **source of truth** for available cash and held quantity, but it is not a source of entry cost basis. At startup, the bot replays account-scoped `logs/api_journal.jsonl`, then queries Roostoo's authenticated `POST /v3/query_order` endpoint for each supported held pair whose ledger metadata is incomplete. The documented response contains history records in `OrderMatched`, paginated with `offset` and `limit` and `pending_only=FALSE`; it does not return a single `OrderDetail` for pair-history queries. The bot consumes that response shape and sends verified records through the same reconstruction path. Each journal request is tagged with a truncated SHA-256 fingerprint of the API key; the credential itself is never written to the journal. Records without the matching fingerprint are not trusted for automatic recovery, so exchange history is queried rather than mixing accounts. Orders are deduplicated by exchange order ID; cumulative partial fills, buys, sells, quote-currency fees, base-currency fee quantity changes, and exchange amount precision are accounted for. Fill time is accepted only from an explicit exchange fill field or a fully filled order's exchange `FinishTimestamp`; local observation time and order creation time are never substituted as fill time. If fee data, fill time, supported-pair status, or wallet-matched quantity cannot be verified, the position remains unresolved and entries stay frozen. Automatic exits are also suppressed while a position remains unresolved.
 
 #### Manual reconciliation procedure
 
-If exchange fill history cannot establish the position basis and quantity, verify them from Roostoo's order history or authoritative account records. Stop the live bot before editing reconciliation input. Create `state/reconciliation_manual.json` next to the ledger in this format:
+If the journal cannot establish the position basis and quantity, verify them from Roostoo's actual order/fill history or other authoritative account records. Do not use the current ticker price as cost basis. Stop the live bot before editing reconciliation input. Create `state/reconciliation_manual.json` next to the ledger in this format:
 
 ```json
 {
   "positions": {
     "BTC": {
-      "record_id": "ec2-btc-20261014",
-      "operator": "operator_name",
-      "source": "Roostoo fill history query",
-      "entry_price": 62500.0,
-      "remaining_quantity": 0.08992,
-      "entry_ts": "2026-10-14T08:30:00Z"
-    },
-    "CAKE": {
-      "record_id": "ec2-cake-20261014",
-      "operator": "operator_name",
-      "source": "Roostoo fill history query",
-      "entry_price": 2.15,
-      "remaining_quantity": 3011.12,
-      "entry_ts": "2026-10-14T08:35:00Z"
-    },
-    "EDEN": {
-      "record_id": "ec2-eden-20261014",
-      "operator": "operator_name",
-      "source": "Roostoo fill history query; original fill time unavailable",
-      "entry_price": 0.085,
-      "remaining_quantity": 111203.6,
-      "entry_ts": null,
-      "entry_timestamp_unknown": true,
-      "time_exit_policy": "disable_time_exit_until_verified_timestamp"
-    },
-    "FIL": {
-      "record_id": "ec2-fil-20261014",
-      "operator": "operator_name",
-      "source": "Roostoo fill history query",
-      "entry_price": 3.80,
-      "remaining_quantity": 5786.78,
-      "entry_ts": "2026-10-14T08:40:00Z"
+      "record_id": "review-2026-10-14-btc-01",
+      "operator": "reviewer name",
+      "source": "Roostoo fill history; order IDs 12345 and 12346",
+      "entry_price": 62000.5,
+      "entry_cost_basis": 62100.0,
+      "remaining_quantity": 0.0125,
+      "entry_ts": "2026-10-01T12:30:00Z"
     }
   }
 }
 ```
 
-Use one symbol per position. `entry_price` must be the verified weighted cost basis in quote currency; `remaining_quantity` must equal the current exchange free-plus-locked quantity at the exchange's supported amount precision; `entry_ts` must be the verified, timezone-aware original entry time. `record_id`, `operator`, and an evidence `source` are required. The bot validates the pair, values, timestamp and wallet quantity before updating `entries`; it appends the prior metadata and attestation to `reconciliation_audit`. A record ID is idempotent and cannot be reused with changed data. Invalid input fails closed; the reconciliation flag is not cleared.
+Use one symbol per position. `entry_price` is the verified weighted average fill price used by X18 trigger calculations; `entry_cost_basis` is the fee-inclusive quote cost per remaining coin and must be verified from fills and commission records. `remaining_quantity` must equal the current exchange free-plus-locked quantity at the exchange's supported amount precision; `entry_ts` must be the verified, timezone-aware original entry time. `record_id`, `operator`, and an evidence `source` are required. The bot validates the pair, values, timestamp and wallet quantity before updating `entries`; it appends the prior metadata and attestation to `reconciliation_audit`. A record ID is idempotent and cannot be reused with changed data. Invalid input fails closed; the reconciliation flag is not cleared.
 
-If the original entry time cannot be established, **do not fabricate one**. Explicitly attest that fact and accept the conservative fallback:
+If the original entry time cannot be established, **do not fabricate one**. Explicitly attest that fact and accept the conservative fallback below:
 
 ```json
 {
-  "entry_ts": null,
-  "entry_timestamp_unknown": true,
-  "time_exit_policy": "disable_time_exit_until_verified_timestamp"
+  "positions": {
+    "BTC": {
+      "record_id": "review-2026-10-14-btc-02",
+      "operator": "reviewer name",
+      "source": "Roostoo fill history confirms basis; original fill time unavailable",
+      "entry_price": 62000.5,
+      "entry_cost_basis": 62100.0,
+      "remaining_quantity": 0.0125,
+      "entry_ts": null,
+      "entry_timestamp_unknown": true,
+      "time_exit_policy": "disable_time_exit_until_verified_timestamp"
+    }
+  }
 }
 ```
 
-This explicit operator attestation completes basis/quantity reconciliation without inventing a timestamp. X18 time-based exits remain disabled for that position until a verified timestamp is supplied; hard-stop (-8%) and available signal exits continue to apply. The fallback and attestation remain recorded in position metadata and the audit trail. Entries can resume only after every held position is either verified or explicitly reconciled under this fallback, and all other reconciliation issues are cleared.
+This explicit operator attestation completes basis/quantity reconciliation without inventing a timestamp. X18 time-based exits remain disabled for that position until a verified timestamp is supplied; hard-stop and available signal exits continue to apply. The fallback and attestation remain recorded in position metadata and the audit trail. Entries can resume only after every held position is either verified or explicitly reconciled under this fallback, and all other reconciliation issues (such as an unavailable bid or unsupported pair) are cleared.
+
+#### Inspect or persist reconciliation from the CLI
+
+With the live bot stopped and the correct account credentials loaded, run:
+
+```bash
+# Query wallet and authenticated order history; print an audit table without writing the ledger:
+python -m rq.cli reconcile --dry-run
+
+# After reviewing each symbol, quantity, basis, timestamp and unresolved reason:
+python -m rq.cli reconcile --confirm
+```
+
+The command is read-only by default. `--dry-run` and `--confirm` are mutually exclusive. The confirmed form writes the validated reconciliation atomically; it does not place orders. Do not use `--confirm` until the output and any manual evidence have been reviewed.
+
+#### Safe recovery commands on an existing account
+
+Run from the deployed repository root with the bot stopped; do not delete the ledger, API journal, or pending-order marker.
+
+```bash
+git status --short
+git rev-parse --short HEAD
+python3 -m pytest -q
+python3 -m rq.cli live --dry-run
+```
+
+The dry run queries read-only order history and reports which held positions were recovered and which remain unresolved. It must not submit orders or write the production ledger. If a position remains unresolved, independently verify order IDs, filled quantities, weighted fill price, fee-inclusive cost basis, remaining exchange quantity, and original fill time from Roostoo history. Stop the bot before editing `state/reconciliation_manual.json` and follow the attestation schema above. Repeat the dry run and verify every held symbol and quantity. The live process persists successful reconciliation and its audit trail in `state/ledger.json`; do not manually clear `reconciliation_required`. If history is unavailable or pagination is truncated, reconciliation fails closed.
 
 ### 18.6 Start gate
 

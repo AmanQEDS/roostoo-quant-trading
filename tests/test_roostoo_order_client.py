@@ -80,3 +80,40 @@ def test_query_order_rejects_unsuccessful_api_response(monkeypatch):
 
     with pytest.raises(RoostooError, match="order not found"):
         client.query_order(order_id="123")
+
+
+def test_query_order_history_reads_order_matched_and_paginates():
+    client = RoostooClient(journal=None, min_interval_s=0)
+    calls = []
+    responses = [
+        {"Success": True, "OrderMatched": [
+            {"OrderID": 1, "Pair": "BTC/USD", "CreateTimestamp": 1000, "FilledQuantity": 1},
+            {"OrderID": 2, "Pair": "BTC/USD", "CreateTimestamp": 2000, "FilledQuantity": 1},
+        ]},
+        {"Success": False, "ErrMsg": "no order matched"},
+    ]
+    def fake_request(method, path, params, signed=False):
+        calls.append((method, path, dict(params), signed))
+        return responses.pop(0)
+    client._request = fake_request
+    orders = client.query_order_history("BTC/USD", limit=2)
+    assert [order["OrderID"] for order in orders] == [1, 2]
+    assert calls[0][1] == "/v3/query_order"
+    assert calls[0][2]["pending_only"] == "FALSE"
+    assert calls[1][2]["offset"] == 2
+    assert all(call[3] for call in calls)
+
+
+def test_query_order_history_fails_closed_on_incomplete_pagination():
+    client = RoostooClient(journal=None, min_interval_s=0)
+    client._request = lambda *args, **kwargs: {
+        "Success": True, "OrderMatched": [{"OrderID": 1, "Pair": "BTC/USD", "FilledQuantity": 1}]
+    }
+    with pytest.raises(RoostooError, match="refusing incomplete reconciliation"):
+        client.query_order_history("BTC/USD", limit=1, max_pages=1)
+
+
+def test_query_order_history_treats_empty_history_as_empty():
+    client = RoostooClient(journal=None, min_interval_s=0)
+    client._request = lambda *args, **kwargs: {"Success": False, "ErrMsg": "no order matched"}
+    assert client.query_order_history("BTC/USD") == []

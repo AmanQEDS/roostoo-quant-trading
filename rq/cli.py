@@ -108,8 +108,9 @@ def main(argv=None):
     lv.add_argument("--confirm", action="store_true")
 
     rc = sub.add_parser("reconcile", help="inspect or perform position reconciliation")
-    rc.add_argument("--dry-run", action="store_true")
-    rc.add_argument("--confirm", action="store_true")
+    reconcile_mode = rc.add_mutually_exclusive_group()
+    reconcile_mode.add_argument("--dry-run", action="store_true")
+    reconcile_mode.add_argument("--confirm", action="store_true")
     rc.add_argument("--manual", default=None, help="path to manual reconciliation JSON file")
 
     args = ap.parse_args(argv)
@@ -145,11 +146,8 @@ def main(argv=None):
         from .roostoo.client import RoostooClient
         from .live.reconciliation import (
             recover_from_exchange_orders,
-            recover_from_execution_journal,
             apply_manual_reconciliation,
             reconcile_crypto_holdings,
-            execution_journal_scope,
-            _balance_quantity,
         )
         api = RoostooClient()
         api.sync_clock()
@@ -167,12 +165,24 @@ def main(argv=None):
         reconciliation_required = state.setdefault("reconciliation_required", {})
         audit = state.setdefault("reconciliation_audit", [])
 
-        rec_ex = recover_from_exchange_orders(api, wallet, pairs, entries, reconciliation_required)
-        rec_jr = recover_from_execution_journal(
-            getattr(api, "journal", None),
-            wallet, pairs, entries, reconciliation_required,
-            account_scope=execution_journal_scope(getattr(api, "key", "")),
+        recovered = recover_from_exchange_orders(
+            api, wallet, pairs, entries, reconciliation_required
         )
+        recovered_at = pd.Timestamp.now(tz="UTC").isoformat()
+        for coin in recovered:
+            meta = entries.get(coin, {})
+            audit.append(
+                {
+                    "action": "manual_cli_position_recovery",
+                    "coin": coin,
+                    "recorded_at": recovered_at,
+                    "source": meta.get("entry_source"),
+                    "entry_price": meta.get("entry_price"),
+                    "entry_cost_basis": meta.get("entry_cost_basis"),
+                    "remaining_quantity": meta.get("remaining_quantity"),
+                    "entry_ts": meta.get("entry_ts"),
+                }
+            )
         manual_path = Path(args.manual) if args.manual else state_path.with_name("reconciliation_manual.json")
         rec_man = []
         if manual_path.exists():
@@ -190,7 +200,12 @@ def main(argv=None):
             status_str = "RESOLVED" if is_res else "UNRESOLVED"
             basis_str = f"${meta.get('entry_price', 0):.4f}" if meta.get("entry_price") else "N/A"
             ts_str = str(meta.get("entry_ts") or meta.get("time_exit_policy") or "missing")
-            src_str = meta.get("entry_source", {}).get("type") if is_res else reconciliation_required.get(coin, {}).get("reason", "unresolved")
+            entry_source = meta.get("entry_source")
+            src_str = (
+                entry_source.get("type", "verified")
+                if is_res and isinstance(entry_source, dict)
+                else reconciliation_required.get(coin, {}).get("reason", "unresolved")
+            )
             print(f"{coin:<8} {qty:<14.8g} {status_str:<12} {basis_str:<14} {ts_str:<28} {src_str}")
 
         if args.confirm:

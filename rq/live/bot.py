@@ -14,6 +14,7 @@ import logging
 import math
 import time
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import requests
@@ -32,7 +33,6 @@ from .reconciliation import (
     apply_manual_reconciliation,
     execution_journal_scope,
     reconcile_crypto_holdings,
-    recover_from_exchange_orders,
     recover_from_execution_journal,
 )
 from .regime_filter import f2_regime
@@ -615,31 +615,122 @@ class Bot:
         audit = self.state.setdefault("reconciliation_audit", [])
         if not isinstance(audit, list):
             raise ValueError("ledger reconciliation_audit must be a list")
-        recovered_exchange = recover_from_exchange_orders(
-            self.api,
-            wallet,
-            self.pairs,
-            entries,
-            reconciliation_required,
-        )
-        if recovered_exchange:
-            log.warning(
-                "POSITION HISTORY RECOVERED from exchange order history: %s",
-                ", ".join(sorted(recovered_exchange)),
+        account_scope = execution_journal_scope(getattr(self.api, "key", ""))
+        history_events: list[dict[str, Any]] = []
+        history_diagnostics = self.state.setdefault("reconciliation_history", {})
+        history_lookup = getattr(self.api, "query_order_history", None)
+        for coin, raw_balance in wallet.items():
+            if coin == "USD" or not isinstance(raw_balance, dict):
+                continue
+            quantity = _finite_float(raw_balance.get("Free")) + _finite_float(raw_balance.get("Lock"))
+            if quantity <= 0:
+                continue
+            pair = f"{coin}/USD"
+            pair_info = self.pairs.get(pair)
+            if not isinstance(pair_info, dict) or pair_info.get("AssetType") != "crypto" or not pair_info.get("CanTrade"):
+                continue
+            meta = entries.get(coin, {})
+            if not isinstance(meta, dict):
+                meta = {}
+            entry_price = _finite_float(meta.get("entry_price"))
+            local_quantity = _finite_float(meta.get("remaining_quantity"))
+            entry_ts_raw = meta.get("entry_signal_bar_ts") or meta.get("entry_ts")
+            timestamp_ok = False
+            if entry_ts_raw:
+                try:
+                    parsed_ts = pd.Timestamp(entry_ts_raw)
+                    timestamp_ok = parsed_ts.tzinfo is not None and not pd.isna(parsed_ts) and parsed_ts <= pd.Timestamp.now(tz="UTC")
+                except (TypeError, ValueError, OverflowError):
+                    timestamp_ok = False
+            unknown_time_ok = (
+                meta.get("entry_time_status") == "unknown_operator_attested"
+                and meta.get("time_exit_policy") == UNKNOWN_TIME_POLICY
+                and entry_ts_raw in (None, "")
             )
+            try:
+                tolerance = max(1e-12, 0.5 * 10 ** (-int(pair_info.get("AmountPrecision", 8))), quantity * 1e-10)
+            except (TypeError, ValueError, OverflowError):
+                tolerance = 0.0
+            marker = reconciliation_required.get(coin)
+            needs_history = (
+                entry_price <= 0
+                or (not timestamp_ok and not unknown_time_ok)
+                or local_quantity <= 0
+                or abs(local_quantity - quantity) > tolerance
+                or (
+                    isinstance(marker, dict)
+                    and marker.get("reason") in {
+                        "missing_verified_entry_cost_basis", "missing_entry_timestamp",
+                        "exchange_local_quantity_mismatch", "execution_history_quantity_mismatch",
+                        "execution_history_basis_mismatch",
+                    }
+                )
+            )
+            if not needs_history:
+                continue
+            if not callable(history_lookup):
+                history_diagnostics[coin] = {
+                    "status": "unavailable", "reason": "client_missing_query_order_history",
+                    "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                }
+                log.warning("EXCHANGE ORDER HISTORY UNAVAILABLE for %s; position remains unresolved", coin)
+                continue
+            try:
+                order_details = history_lookup(pair=pair)
+                if not isinstance(order_details, list):
+                    raise ValueError("history client did not return a list")
+                history_diagnostics[coin] = {
+                    "status": "queried", "order_count": len(order_details),
+                    "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                }
+                for detail in order_details:
+                    if not isinstance(detail, dict) or detail.get("Pair") != pair or str(detail.get("Side", "")).upper() not in {"BUY", "SELL"}:
+                        continue
+                    history_events.append({
+                        "t": time.time(), "account_scope": account_scope,
+                        "method": "POST", "path": "/v3/query_order",
+                        "params": {"pair": pair, "pending_only": "FALSE"},
+                        "resp": {"Success": True, "OrderMatched": [detail]},
+                    })
+                if not order_details:
+                    log.warning("EXCHANGE ORDER HISTORY EMPTY for %s; manual evidence may be required", coin)
+            except Exception as exc:
+                history_diagnostics[coin] = {
+                    "status": "unavailable", "error": str(exc)[:300],
+                    "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                }
+                log.exception("EXCHANGE ORDER HISTORY LOOKUP FAILED for %s; position remains unresolved", coin)
+
         recovered = recover_from_execution_journal(
-            getattr(self.api, "journal", None),
-            wallet,
-            self.pairs,
-            entries,
-            reconciliation_required,
-            account_scope=execution_journal_scope(
-                getattr(self.api, "key", "")
-            ),
+            getattr(self.api, "journal", None), wallet, self.pairs, entries,
+            reconciliation_required, account_scope=account_scope,
+            additional_events=history_events,
         )
         if recovered:
+            recovered_at = pd.Timestamp.now(tz="UTC").isoformat()
+            for coin in recovered:
+                meta = entries.get(coin, {})
+                audit.append({
+                    "action": "automatic_position_recovery", "coin": coin,
+                    "recorded_at": recovered_at, "source": meta.get("entry_source"),
+                    "entry_price": meta.get("entry_price"),
+                    "remaining_quantity": meta.get("remaining_quantity"),
+                    "entry_ts": meta.get("entry_ts"),
+                })
+                # Dry-run intentionally does not persist ledger mutations, so
+                # emit the verified recovered metadata for operator review.
+                log.info("POSITION RECOVERY DETAIL %s", json.dumps({
+                    "coin": coin,
+                    "entry_price": meta.get("entry_price"),
+                    "entry_cost_basis": meta.get("entry_cost_basis"),
+                    "remaining_quantity": meta.get("remaining_quantity"),
+                    "entry_ts": meta.get("entry_ts"),
+                    "entry_fees_quote": meta.get("entry_fees_quote"),
+                    "entry_fees_base": meta.get("entry_fees_base"),
+                    "entry_source": meta.get("entry_source"),
+                }, sort_keys=True))
             log.warning(
-                "POSITION HISTORY RECOVERED from persisted confirmed order records: %s",
+                "POSITION HISTORY RECOVERED from persisted/exchange order records: %s",
                 ", ".join(sorted(recovered)),
             )
         manual_path = self.state_path.with_name("reconciliation_manual.json")
@@ -681,6 +772,19 @@ class Bot:
                 "ENTRY FREEZE: exchange holdings require manual reconciliation: %s",
                 ", ".join(sorted(unresolved)),
             )
+            for coin in unresolved:
+                marker = reconciliation_required.get(coin, {})
+                diagnostic = history_diagnostics.get(coin, {})
+                log.critical("RECONCILIATION REQUIRED DETAIL %s", json.dumps({
+                    "coin": coin,
+                    "reason": marker.get("reason") if isinstance(marker, dict) else "unknown",
+                    "observed_quantity": marker.get("observed_quantity") if isinstance(marker, dict) else None,
+                    "ledger_quantity": (
+                        entries.get(coin, {}).get("remaining_quantity")
+                        if isinstance(entries.get(coin), dict) else None
+                    ),
+                    "history": diagnostic,
+                }, sort_keys=True))
 
         for coin in held:
             meta = entries.get(coin, {})
@@ -843,7 +947,15 @@ class Bot:
         exit_reasons = {}
         if x18_enabled:
             current_bar = getattr(self, "current_signal_bar", None)
+            unresolved_set = set(unresolved)
             for coin, qty in held.items():
+                if coin in unresolved_set or coin in reconciliation_required:
+                    log.critical(
+                        "AUTOMATIC EXIT SUPPRESSED for unresolved %s; verified basis, timestamp, "
+                        "quantity and executable bid must reconcile first",
+                        coin,
+                    )
+                    continue
                 meta = entries.get(coin, {})
                 entry_px = _finite_float(meta.get("entry_price"))
                 pair = f"{coin}/USD"
@@ -1281,10 +1393,20 @@ class Bot:
                     new_price = new_cost / new_qty
                     if not math.isfinite(new_price) or new_price <= 0:
                         raise ValueError("Unable to derive a positive average entry cost from confirmed fills")
+                    commission_coin = str(detail.get("CommissionCoin") or "USD").upper()
+                    quote_fee_delta = delta_fee if commission_coin == "USD" else 0.0
+                    base_fee_delta = delta_fee if commission_coin == coin else 0.0
+                    old_cost_basis = _finite_float(meta.get("entry_cost_basis"), old_price)
+                    new_cost_basis = (
+                        old_qty * old_cost_basis + delta_notional + quote_fee_delta
+                    ) / new_qty
                     pool_cash["crypto"] -= delta_notional + delta_fee
                     meta.update(
                         {
                             "entry_price": new_price,
+                            "entry_cost_basis": new_cost_basis,
+                            "entry_fees_quote": _finite_float(meta.get("entry_fees_quote")) + quote_fee_delta,
+                            "entry_fees_base": _finite_float(meta.get("entry_fees_base")) + base_fee_delta,
                             "remaining_quantity": new_qty,
                             "entry_quantity": _finite_float(
                                 meta.get("entry_quantity"), old_qty
