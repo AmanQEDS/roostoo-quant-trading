@@ -251,9 +251,20 @@ class Bot:
         self.freq = FREQ_MINUTES[self.cfg["timeframe"]]
 
     def save(self):
-        self.state_path.write_text(
-            json.dumps(self.state, indent=1)
+        """Persist state atomically so an interrupted write cannot truncate the ledger."""
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.state_path.with_suffix(
+            self.state_path.suffix + ".tmp"
         )
+        try:
+            tmp_path.write_text(
+                json.dumps(self.state, indent=1),
+                encoding="utf-8",
+            )
+            tmp_path.replace(self.state_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def signals(self) -> pd.Series:
         self.feed.update()
@@ -339,73 +350,26 @@ class Bot:
         return t
 
     def _liquidate_equities(self, wallet, tick):
-        """One-time migration cleanup: sell existing Roostoo stock holdings."""
-        for coin, v in wallet.items():
+        """Do not submit stock orders from this crypto-only trading bot."""
+        stock_holdings = []
+
+        for coin, value in wallet.items():
             if coin == "USD":
                 continue
 
             pair = f"{coin}/USD"
             info = self.pairs.get(pair)
 
-            if not info or info.get("AssetType") != "stock":
-                continue
+            if info and info.get("AssetType") == "stock":
+                free_qty = float(value.get("Free", 0) or 0)
+                if free_qty > 0:
+                    stock_holdings.append((pair, free_qty))
 
-            free_qty = float(v.get("Free", 0) or 0)
-            if free_qty <= 0:
-                continue
-
-            qty = plan_exit(
-                free_qty,
-                info["AmountPrecision"],
-            )
-
-            if qty <= 0:
-                continue
-
-            log.info(
-                "ORDER_INTENT %s",
-                json.dumps({
-                    "ts": pd.Timestamp.utcnow().isoformat(),
-                    "symbol": pair, "side": "SELL", "qty": qty,
-                    "reason": "SELL_EQUITY_LIQ", "entry_price": None,
-                    "entry_ts": None, "last_price": tick.get(pair, {}).get("LastPrice"),
-                    "unrealized_pnl": None, "peak_price_since_entry": None,
-                    "mfe": None, "mae": None,
-                    "equity": self.order_context.get("equity"),
-                    "peak_equity": self.order_context.get("peak_equity"),
-                    "drawdown": self.order_context.get("drawdown"),
-                    "dd_multiplier": self.order_context.get("dd_multiplier"),
-                }, sort_keys=True),
-            )
-
-            if self.dry:
-                log.info(
-                    "[dry-run] LIQUIDATE EXISTING EQUITY %s %s",
-                    qty,
-                    pair,
-                )
-                continue
-
-            try:
-                d = self.api.place_order(
-                    pair,
-                    "SELL",
-                    qty,
-                )
-            except Exception as e:
-                log.error(
-                    "equity liquidation failed SELL %s: %s",
-                    pair,
-                    e,
-                )
-                continue
-
-            log.info(
-                "equity liquidation filled SELL %s %s @ %s fee=%s",
-                d.get("FilledQuantity"),
-                pair,
-                d.get("FilledAverPrice"),
-                d.get("CommissionChargeValue", 0),
+        if stock_holdings:
+            log.warning(
+                "STOCK LIQUIDATION SKIPPED: this bot is crypto-only. "
+                "Review these holdings manually: %s",
+                stock_holdings,
             )
 
     def cycle(self):
@@ -432,6 +396,15 @@ class Bot:
         # liquidated immediately on deployment before normal crypto trading.
         tick = self.api.ticker()
         wallet = self.api.balance()
+
+        # An unresolved submission blocks ALL order paths, including
+        # the separate equity-liquidation path, until reconciliation.
+        if not self.dry and self.state.get("pending_order"):
+            log.critical(
+                "TRADING HALTED: unresolved order requires exchange reconciliation: %s",
+                self.state["pending_order"],
+            )
+            return
 
         self._liquidate_equities(wallet, tick)
 
@@ -868,6 +841,15 @@ class Bot:
         if qty <= 0:
             return False
 
+        # Fail closed if a previous live order has not been reconciled.
+        if not self.dry and self.state.get("pending_order"):
+            pending = self.state["pending_order"]
+            log.error(
+                "BLOCKED order: unresolved order state exists: %s",
+                pending,
+            )
+            return False
+
         meta = self.state.setdefault("entries", {}).get(coin, {})
         last_price = float(
             tick.get(pair, {}).get("LastPrice")
@@ -907,6 +889,18 @@ class Bot:
             )
             return True
 
+        # Persist intent BEFORE submitting. A crash or timeout is treated
+        # as uncertain until the exchange is reconciled manually.
+        self.state["pending_order"] = {
+            "status": "submitting",
+            "symbol": pair,
+            "side": side,
+            "quantity": float(qty),
+            "reason": reason,
+            "created_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        }
+        self.save()
+
         try:
             d = self.api.place_order(
                 pair,
@@ -914,22 +908,40 @@ class Bot:
                 qty,
             )
         except Exception as e:
+            self.state["pending_order"]["status"] = "uncertain"
+            self.state["pending_order"]["error"] = repr(e)
+            self.save()
             log.error(
-                "order failed %s %s: %s",
+                "ORDER UNCERTAIN %s %s: %s; trading is blocked pending reconciliation",
                 side,
                 pair,
                 e,
             )
             return False
 
-        filled_qty = float(d.get("FilledQuantity") or 0)
-        fill_px = float(d.get("FilledAverPrice") or 0)
-        fee = float(d.get("CommissionChargeValue") or 0)
+        try:
+            filled_qty = float(d.get("FilledQuantity") or 0)
+            fill_px = float(d.get("FilledAverPrice") or 0)
+            fee = float(d.get("CommissionChargeValue") or 0)
+        except (AttributeError, TypeError, ValueError) as e:
+            self.state["pending_order"]["status"] = "uncertain"
+            self.state["pending_order"]["error"] = (
+                "Malformed order response: " + repr(e)
+            )
+            self.save()
+            log.error(
+                "ORDER UNCERTAIN %s %s: malformed response; trading is blocked",
+                side, pair,
+            )
+            return False
 
         if filled_qty <= 0 or fill_px <= 0:
+            self.state["pending_order"]["status"] = "uncertain"
+            self.state["pending_order"]["response"] = d
+            self.save()
             log.error(
-                "order returned no valid fill for %s %s: filled_qty=%s fill_px=%s",
-                side, pair, filled_qty, fill_px,
+                "ORDER UNCERTAIN %s %s: no valid fill; trading is blocked",
+                side, pair,
             )
             return False
 
@@ -965,6 +977,25 @@ class Bot:
                     pair, qty, filled_qty,
                 )
 
+        # Keep trading halted when the exchange reports a partial fill.
+        # Reconcile the remaining order before allowing another submission.
+        fill_tolerance = max(1e-12, float(qty) * 1e-8)
+        if filled_qty + fill_tolerance < float(qty):
+            pending = self.state["pending_order"]
+            pending["status"] = "partial_fill"
+            pending["filled_quantity"] = filled_qty
+            pending["average_fill_price"] = fill_px
+            pending["response"] = d
+            self.save()
+            log.critical(
+                "PARTIAL FILL: %s requested=%s filled=%s; "
+                "trading remains blocked pending reconciliation",
+                pair, qty, filled_qty,
+            )
+            return False
+
+        # Clear only after a full fill has been recorded and saved.
+        self.state.pop("pending_order", None)
         self.save()
 
         log.info(
