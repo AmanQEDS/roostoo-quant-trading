@@ -959,3 +959,31 @@ def test_dry_run_queries_exchange_history_and_reconciles_four_holdings_without_o
     assert all(bot.state["reconciliation_history"][coin]["status"] == "queried" for coin in holdings)
     assert {event["coin"] for event in bot.state["reconciliation_audit"] if event.get("action") == "automatic_position_recovery"} == set(holdings)
     assert ledger.read_bytes() == before
+
+
+def test_recovery_accounts_for_base_coin_commission_using_exchange_coin_delta(tmp_path):
+    scope = execution_journal_scope("base-fee-account")
+    qty, price, fee = 0.99, 100.0, 0.01
+    detail = {
+        "OrderID": "base-fee-buy", "Pair": "BTC/USD", "Side": "BUY", "Status": "FILLED",
+        "FilledQuantity": 1.0, "FilledAverPrice": price,
+        "CommissionCoin": "BTC", "CommissionChargeValue": fee, "CommissionPercent": 0.001,
+        "CoinChange": -qty, "CreateTimestamp": 1790841600000, "FinishTimestamp": 1790841601000,
+    }
+    journal = tmp_path / "api_journal.jsonl"
+    journal.write_text(json.dumps({
+        "t": 1790841602, "account_scope": scope, "method": "POST", "path": "/v3/query_order",
+        "params": {"pair": "BTC/USD", "pending_only": "FALSE"},
+        "resp": {"Success": True, "OrderMatched": [detail]},
+    }) + "\n", encoding="utf-8")
+    entries, required = {}, {}
+    recovered = recover_from_execution_journal(
+        journal, {"BTC": {"Free": qty, "Lock": 0}},
+        {"BTC/USD": {"AssetType": "crypto", "CanTrade": True, "AmountPrecision": 8}},
+        entries, required, account_scope=scope,
+    )
+    assert recovered == ["BTC"]
+    assert entries["BTC"]["remaining_quantity"] == pytest.approx(qty)
+    assert entries["BTC"]["entry_price"] == pytest.approx(price)
+    assert entries["BTC"]["entry_cost_basis"] == pytest.approx(price / qty)
+    assert entries["BTC"]["entry_fees_base"] == pytest.approx(fee)

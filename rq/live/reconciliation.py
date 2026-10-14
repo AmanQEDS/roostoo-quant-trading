@@ -198,6 +198,16 @@ def _finite_positive(value: Any) -> float | None:
     return result if math.isfinite(result) and result > 0 else None
 
 
+def _absolute_positive(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        result = abs(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) and result > 0 else None
+
+
 def _order_details(response: Any) -> list[dict[str, Any]]:
     """Normalize place-order and documented query-order response shapes."""
     if not isinstance(response, dict) or response.get("Success") is False:
@@ -400,7 +410,7 @@ def recover_from_execution_journal(
                 if fee_amount > 0 and fee_coin == "USD":
                     quote_cost += fee_amount
                 elif fee_amount > 0 and fee_coin == coin:
-                    coin_delta = _finite_positive(detail.get("CoinChange"))
+                    coin_delta = _absolute_positive(detail.get("CoinChange"))
                     acquired_quantity = coin_delta if coin_delta is not None else quantity - fee_amount
                 if acquired_quantity <= 0:
                     ambiguous = True
@@ -423,7 +433,7 @@ def recover_from_execution_journal(
                 continue
             sold_quantity = quantity
             if fee_amount > 0 and fee_coin == coin:
-                coin_delta = _finite_positive(detail.get("CoinChange"))
+                coin_delta = _absolute_positive(detail.get("CoinChange"))
                 sold_quantity = coin_delta if coin_delta is not None else quantity + fee_amount
             remaining_to_sell = sold_quantity
             while remaining_to_sell > 1e-12 and lots:
